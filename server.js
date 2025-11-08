@@ -13,7 +13,7 @@ var UNIT_ID = parseInt(process.env.UNIT_ID || "85", 10); // try 1 or 85
 const START_ADDR = parseInt(process.env.START_ADDR || "5000", 10);
 var COUNT = parseInt(process.env.COUNT || "74", 10);
 const ZERO_BASED = true;
-const workspaceId = "68de43d477ac61e06d4c9f9f";
+const workspaceId = "690f350453c8c174cb093c60";
 var machineData = {};
 var REGISTER = {
     nazon: {
