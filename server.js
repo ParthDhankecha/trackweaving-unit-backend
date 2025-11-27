@@ -254,6 +254,7 @@ async function pollLoop(machine) {
         }
         machineData[machineId].rawData = data;
         machineData[machineId].shift = at(REGISTER[machine.displayType].shift);
+        machineData[machineId].updatedTime = moment().utc().format();
     }
     for (; ;) {
         try {
@@ -303,8 +304,14 @@ setInterval(async () => {
     try {
         if(isDataStorAPICalled) return;
         isDataStorAPICalled = true;
+        let dataToSend = {};
+        for(let machineId in machineData) {
+            if(machineData[machineId].updatedTime && moment().diff(moment(machineData[machineId].updatedTime), 'hours') < 1) {
+                dataToSend[machineId] = { ...machineData[machineId] };
+            }
+        }
         await axios.post('https://trackweaving.com/api/v1/machine-logs', {
-            logs: machineData,
+            logs: dataToSend,
             workspaceId: workspaceId,
             apiKey: "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21"
         });
