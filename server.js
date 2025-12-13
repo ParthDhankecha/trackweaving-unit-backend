@@ -1,21 +1,20 @@
-// index.js
-const { default: axios } = require("axios");
+// server.js / index.js
 const express = require("express");
+const axios = require("axios");
 const ModbusRTU = require("modbus-serial");
-
-const app = express();
 const moment = require("moment");
 
+const app = express();
+
 // ====== CONFIG ======
-const LOOM_IP = process.env.LOOM_IP || "192.168.205.2";
 const LOOM_PORT = parseInt(process.env.LOOM_PORT || "502", 10);
-var UNIT_ID = parseInt(process.env.UNIT_ID || "85", 10); // try 1 or 85
 const START_ADDR = parseInt(process.env.START_ADDR || "5000", 10);
-var COUNT = parseInt(process.env.COUNT || "74", 10);
+const COUNT = parseInt(process.env.COUNT || "74", 10);
 const ZERO_BASED = true;
+
 const workspaceId = "690f350453c8c174cb093c60";
-var machineData = {};
-var REGISTER = {
+
+const REGISTER = {
     nazon: {
         stop: 5027,
         shift: 5012,
@@ -34,308 +33,393 @@ var REGISTER = {
         speed: 5003,
         efficiency: 5044
     }
-}
+};
+
+let machineData = {};
+let isDataStorAPICalled = false;
+
+// Track all active clients for graceful shutdown
+const allClients = new Set();
 
 // ====== HELPERS ======
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ====== POLLING LOOP (sequential, no overlaps) ======
+function initMachineData(machineId, displayType) {
+    machineData[machineId] = {
+        displayType,
+        stopCount: 0,
+        stopsData: {
+            warp: [],
+            weft: [],
+            feeder: [],
+            manual: [],
+            other: []
+        },
+        lastStopTime: null,
+        lastStartTime: null,
+        stop: 0
+    };
+}
+
+function setStopData(machineId, displayType) {
+    let stopDuration = 0;
+
+    if (machineData[machineId].lastStopTime) {
+        const stopTime = moment(machineData[machineId].lastStopTime);
+        stopDuration = Math.abs(moment().diff(stopTime, "seconds"));
+        if (stopDuration >= 60) {
+            machineData[machineId].stopCount += 1;
+        }
+    }
+
+    const stopCode = machineData[machineId].stop;
+    const baseEntry = {
+        start: machineData[machineId].lastStopTime,
+        end: moment().utc().format(),
+        statusCode: stopCode,
+        duration: stopDuration
+    };
+
+    // Logic split by displayType
+    if (displayType === "nazon") {
+        switch (stopCode) {
+            case 1:
+            case 19:
+            case 20:
+                machineData[machineId].stopsData.warp.push(baseEntry);
+                break;
+            case 2:
+            case 3:
+            case 11:
+            case 12:
+            case 15:
+            case 16:
+            case 17:
+            case 18:
+                machineData[machineId].stopsData.weft.push(baseEntry);
+                break;
+            case 7:
+                machineData[machineId].stopsData.feeder.push(baseEntry);
+                break;
+            case 4:
+            case 6:
+                machineData[machineId].stopsData.manual.push(baseEntry);
+                break;
+            default:
+                machineData[machineId].stopsData.other.push(baseEntry);
+                break;
+        }
+    } else if (displayType === "chitic") {
+        switch (stopCode) {
+            case 1:
+                machineData[machineId].stopsData.warp.push(baseEntry);
+                break;
+            case 2:
+            case 3:
+            case 11:
+            case 12:
+                machineData[machineId].stopsData.weft.push(baseEntry);
+                break;
+            case 7:
+                machineData[machineId].stopsData.feeder.push(baseEntry);
+                break;
+            case 4:
+            case 6:
+                machineData[machineId].stopsData.manual.push(baseEntry);
+                break;
+            default:
+                machineData[machineId].stopsData.other.push(baseEntry);
+                break;
+        }
+    }
+}
+
+function processData(machine, data) {
+    const machineId = machine.id;
+    const displayType = machine.displayType || "nazon";
+    const reg = REGISTER[displayType];
+
+    if (!reg) {
+        console.warn(`Unknown displayType "${displayType}" for machine ${machineId}`);
+        return;
+    }
+
+    const startAddr = ZERO_BASED ? START_ADDR - 1 : START_ADDR;
+    const at = (addr) => data[addr - startAddr];
+
+    let speed = at(reg.speed);
+    let stop = at(reg.stop);
+
+    // Special handling for chitic displays
+    if (displayType === "chitic") {
+        if (speed > 5) {
+            data[reg.stop - startAddr] = 0;
+            stop = 0;
+        }
+    }
+
+    if (!machineData[machineId]) {
+        initMachineData(machineId, displayType);
+    }
+
+    // Handle transitions between running and stopped
+    if (machineData[machineId].stop === 0 && stop !== 0) {
+        // just stopped
+        machineData[machineId].lastStopTime = moment().utc().format();
+    } else if (machineData[machineId].stop !== 0 && stop === 0) {
+        // just started
+        machineData[machineId].lastStartTime = moment().utc().format();
+        setStopData(machineId, displayType);
+    } else if (
+        typeof machineData[machineId].shift === "number" &&
+        at(reg.shift) !== machineData[machineId].shift
+    ) {
+        // shift change
+        if (machineData[machineId].stop !== 0 && stop !== 0) {
+            setStopData(machineId, displayType);
+            machineData[machineId].lastStopTime = moment().utc().format();
+        }
+
+        machineData[machineId].prevData = JSON.parse(JSON.stringify(machineData[machineId]));
+        machineData[machineId].stopCount = 0;
+        machineData[machineId].stopsData = {
+            warp: [],
+            weft: [],
+            feeder: [],
+            manual: [],
+            other: []
+        };
+
+        if (machineData[machineId].stop === 0 && stop === 0) {
+            machineData[machineId].lastStartTime = moment().utc().format();
+        }
+    }
+
+    machineData[machineId].stop = stop;
+
+    // Adjust setPicks and efficiency for some device types
+    if (machine.deviceType === "rs485" || displayType === "chitic") {
+        data[reg.setPicks - startAddr] = at(reg.setPicks) / 10;
+    }
+    if (displayType === "chitic") {
+        data[reg.efficiency - startAddr] = at(reg.efficiency);
+    }
+
+    machineData[machineId].rawData = data;
+    machineData[machineId].shift = at(reg.shift);
+    machineData[machineId].updatedTime = moment().utc().format();
+}
+
+// ====== POLLING LOOP (per machine) ======
 async function pollLoop(machine) {
-    // simple backoff on errors
-    let backoffMs = 1000;
-
-    // ====== STATE ======
     const client = new ModbusRTU();
+    allClients.add(client);
+
+    const displayType = machine.displayType || "nazon";
+    const unitId = displayType === "chitic" ? 1 : 85;
+
+    let backoffMs = 1000;
     let lastError = null;
     let connecting = false;
 
-    // ====== CONNECTION HANDLING ======
+    const ip = machine.ip;
+
+    // Event handlers to avoid unhandled errors
+    client.on("error", (e) => {
+        lastError = e?.message || String(e);
+        console.log(`Client error on ${ip}:`, lastError);
+        try {
+            if (client.isOpen) client.close();
+        } catch (_) {}
+    });
+
+    client.on("close", () => {
+        console.log(`Connection closed for ${ip}`);
+    });
+
     async function connect() {
         if (client.isOpen || connecting) return;
         connecting = true;
         try {
-            await client.connectTCP(machine.ip, { port: LOOM_PORT });
-            machine.displayType == 'chitic' ? UNIT_ID = 1 : UNIT_ID = 85;
-            client.setID(UNIT_ID);
-            client.setTimeout(1000);
+            console.log(`Connecting to ${ip}:${LOOM_PORT} (UNIT_ID=${unitId})...`);
+            await client.connectTCP(ip, { port: LOOM_PORT });
+            client.setID(unitId);
+            // IMPORTANT: do NOT set client.setTimeout here; the library
+            // sometimes throws uncaught on its own TCP timeout.
+            console.log(`Connected to ${ip}:${LOOM_PORT} (UNIT_ID=${unitId})`);
             lastError = null;
         } catch (e) {
             lastError = e?.message || String(e);
-            try { if (client.isOpen) client.close(); } catch { }
+            console.log(`Connect error for ${ip}:`, lastError);
+            try {
+                if (client.isOpen) client.close();
+            } catch (_) {}
         } finally {
             connecting = false;
         }
     }
 
-    // Defensive: mark error on unexpected close/error
-    client.on?.("close", () => { /* socket closed */ });
-    client.on?.("error", (e) => { lastError = e?.message || String(e); });
+    const start = ZERO_BASED ? START_ADDR - 1 : START_ADDR;
 
-    function initMachineData(machineId) {
-        machineData[machineId] = {
-            displayType: machine.displayType,
-            stopCount: 0,
-            stopsData: {
-                warp: [],
-                weft: [],
-                feeder: [],
-                manual: [],
-                other: []
-            },
-            lastStopTime: null,
-            lastStartTime: null,
-            stop: 0
-        };
-    }
-
-    function setStopData(machineId, data) {
-        let stopDuration = 0;
-        if(machineData[machineId].lastStopTime) {
-            const stopTime = moment(machineData[machineId].lastStopTime);
-            stopDuration = Math.abs(moment().diff(stopTime, 'seconds'));
-            if(stopDuration >= 60) {
-                machineData[machineId].stopCount += 1;
-            }
-        }
-        if(machine.displayType == 'nazon') {
-            switch (machineData[machineId].stop) {
-                case 1:
-                case 19:
-                case 20:
-                    machineData[machineId].stopsData.warp.push({
-                        start: machineData[machineId].lastStopTime,
-                        end: moment().utc().format(),
-                        statusCode: machineData[machineId].stop,
-                        duration: stopDuration
-                    });
-                    break;
-    
-                case 2: 
-                case 3:
-                case 11:
-                case 12:
-                case 15:
-                case 16:
-                case 17:
-                case 18:
-                    machineData[machineId].stopsData.weft.push({
-                        start: machineData[machineId].lastStopTime,
-                        end: moment().utc().format(),
-                        statusCode: machineData[machineId].stop,
-                        duration: stopDuration
-                    });
-                    break;
-    
-                case 7:
-                    machineData[machineId].stopsData.feeder.push({
-                        start: machineData[machineId].lastStopTime,
-                        end: moment().utc().format(),
-                        statusCode: machineData[machineId].stop,
-                        duration: stopDuration
-                    });
-                    break;
-    
-                case 4:
-                case 6:
-                    machineData[machineId].stopsData.manual.push({
-                        start: machineData[machineId].lastStopTime,
-                        end: moment().utc().format(),
-                        statusCode: machineData[machineId].stop,
-                        duration: stopDuration
-                    });
-                    break;
-    
-                default:
-                    machineData[machineId].stopsData.other.push({
-                        start: machineData[machineId].lastStopTime,
-                        end: moment().utc().format(),
-                        duration: stopDuration,
-                        statusCode: machineData[machineId].stop
-                    })
-                    break;
-            }
-        } else if(machine.displayType == 'chitic') {
-            switch (machineData[machineId].stop) {
-                case 1:
-                    machineData[machineId].stopsData.warp.push({
-                        start: machineData[machineId].lastStopTime,
-                        end: moment().utc().format(),
-                        statusCode: machineData[machineId].stop,
-                        duration: stopDuration
-                    });
-                    break;
-    
-                case 2: 
-                case 3:
-                case 11:
-                case 12:
-                    machineData[machineId].stopsData.weft.push({
-                        start: machineData[machineId].lastStopTime,
-                        end: moment().utc().format(),
-                        statusCode: machineData[machineId].stop,
-                        duration: stopDuration
-                    });
-                    break;
-    
-                case 7:
-                    machineData[machineId].stopsData.feeder.push({
-                        start: machineData[machineId].lastStopTime,
-                        end: moment().utc().format(),
-                        statusCode: machineData[machineId].stop,
-                        duration: stopDuration
-                    });
-                    break;
-    
-                case 4:
-                case 6:
-                    machineData[machineId].stopsData.manual.push({
-                        start: machineData[machineId].lastStopTime,
-                        end: moment().utc().format(),
-                        statusCode: machineData[machineId].stop,
-                        duration: stopDuration
-                    });
-                    break;
-    
-                default:
-                    machineData[machineId].stopsData.other.push({
-                        start: machineData[machineId].lastStopTime,
-                        end: moment().utc().format(),
-                        duration: stopDuration,
-                        statusCode: machineData[machineId].stop
-                    })
-                    break;
-            }
-        }
-    }
-
-    function processData(machineId, deviceType, displayType="nazon", data) {
-        const at = (lw) => data[lw - 4999];
-        let speed = at(REGISTER[machine.displayType].speed);
-        let stop = at(REGISTER[machine.displayType].stop);
-        if(machine.displayType == "chitic"){
-            if(speed > 5) {
-                data[REGISTER[machine.displayType].stop - 4999] = 0;
-            }
-        }
-        if ((!machineData[machineId] && stop != 0) || (machineData[machineId] && machineData[machineId].stop == 0 && stop != 0)) {
-            if (!machineData[machineId]) initMachineData(machineId);
-            machineData[machineId].lastStopTime = moment().utc().format();
-        } else if (!machineData[machineId] && stop == 0) {
-            if (!machineData[machineId]) initMachineData(machineId);
-            machineData[machineId].lastStartTime = moment().utc().format();
-        } else if (machineData[machineId] && machineData[machineId].stop != 0 && stop == 0) {
-            machineData[machineId].lastStartTime = moment().utc().format();
-            setStopData(machineId, data);
-        }
-        if(typeof machineData[machineId].shift == "number" && at(REGISTER[machine.displayType].shift) != machineData[machineId].shift) {
-            if(machineData[machineId].stop != 0 && stop != 0) {
-                setStopData(machineId, data);
-                machineData[machineId].lastStopTime = moment().utc().format();
-            }
-            machineData[machineId].prevData = JSON.parse(JSON.stringify(machineData[machineId]));
-            machineData[machineId].stopCount = 0;
-            machineData[machineId].stopsData = {
-                warp: [],
-                weft: [],
-                feeder: [],
-                manual: [],
-                other: []
-            };
-            if(machineData[machineId].stop == 0 && stop == 0) {
-                machineData[machineId].lastStartTime = moment().utc().format();
-            }
-        }
-        machineData[machineId].stop = stop;
-        if(deviceType == 'rs485' || displayType == 'chitic') {
-            data[REGISTER[machine.displayType].setPicks - 4999] = at(REGISTER[machine.displayType].setPicks) / 10;
-        }
-        if(displayType == 'chitic') {
-            data[REGISTER[machine.displayType].efficiency - 4999] = at(REGISTER[machine.displayType].efficiency);
-        }
-        machineData[machineId].rawData = data;
-        machineData[machineId].shift = at(REGISTER[machine.displayType].shift);
-        machineData[machineId].updatedTime = moment().utc().format();
-    }
-    for (; ;) {
+    while (true) {
         try {
-            if (!client.isOpen) {
+            if (!client.isOpen && !connecting) {
                 await connect();
             }
-            if (client.isOpen) {
-                let start = ZERO_BASED ? (START_ADDR - 1) : START_ADDR;
-                const resp = await client.readHoldingRegisters(start, COUNT);
 
-                if(resp.data && resp.data.length > 30 && resp.data[REGISTER[machine.displayType].clothLength - start] == 0 && resp.data[REGISTER[machine.displayType].loomState - start] == 0 && resp.data[REGISTER[machine.displayType].speed - start] == 0) {
-                    console.log(resp.data);
-                } else {
-                    processData(machine.id, machine.deviceType, machine.displayType, resp.data);
+            if (client.isOpen) {
+                let resp;
+                try {
+                    resp = await client.readHoldingRegisters(start, COUNT);
+                } catch (e) {
+                    lastError = e?.message || String(e);
+                    console.log(`Read error for ${ip}:`, lastError);
+                    try {
+                        if (client.isOpen) client.close();
+                    } catch (_) {}
+                    // increase backoff
+                    backoffMs = Math.min(backoffMs * 2, 10000);
+                    await sleep(backoffMs);
+                    continue;
                 }
+
+                const data = resp.data || [];
+                console.log(`Read data from ${ip}:`, data);
+
+                const reg = REGISTER[displayType];
+                if (
+                    data.length > 30 &&
+                    data[reg.clothLength - start] === 0 &&
+                    data[reg.loomState - start] === 0 &&
+                    data[reg.speed - start] === 0
+                ) {
+                    console.log(`Suspicious zero data from ${ip}:`, data);
+                } else {
+                    console.log(`Data from ${ip}:`, data);
+                    processData(machine, data);
+                }
+
                 lastError = null;
                 backoffMs = 1000; // reset backoff on success
             }
         } catch (err) {
-            console.log(err)
-            lastError = err?.message || String(err);
-            try { if (client.isOpen) client.close(); } catch { }
-            // increase backoff up to 10s to avoid hammering a dying socket
+            const msg = err?.message || String(err);
+            console.log(`Unexpected error in pollLoop(${ip}):`, msg);
+            lastError = msg;
+            try {
+                if (client.isOpen) client.close();
+            } catch (_) {}
             backoffMs = Math.min(backoffMs * 2, 10000);
         }
 
-        // Wait either 1s on success or backoff on error
         await sleep(backoffMs);
     }
 }
 
+// ====== INIT ALL MACHINES ======
 async function initAllMachines() {
-    let initData = await axios.post('https://trackweaving.com/api/v1/machine-logs/machine-list', {
-        workspaceId: workspaceId,
-        apiKey: "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21"
-    });
+    let initData = await axios.post(
+        "https://trackweaving.com/api/v1/machine-logs/machine-list",
+        {
+            workspaceId: workspaceId,
+            apiKey:
+                "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21"
+        }
+    );
+
     initData = initData.data;
-    for(let machine of initData.data.machines) {
-        pollLoop(machine);
-    }
+
+    // preload machineData if backend sends something
     machineData = initData.data.machineData || {};
+
+    for (let machine of initData.data.machines) {
+        // fire and forget, each has its own loop and connection
+        pollLoop(machine).catch((e) => {
+            console.error(`pollLoop crashed for machine ${machine.id}:`, e);
+        });
+    }
 }
 
-var isDataStorAPICalled = false;
-
+// ====== PERIODIC DATA PUSH ======
 setInterval(async () => {
+    if (isDataStorAPICalled) return;
+
     try {
-        if(isDataStorAPICalled) return;
         isDataStorAPICalled = true;
-        let dataToSend = {};
-        for(let machineId in machineData) {
-            if(machineData[machineId].updatedTime && moment().diff(moment(machineData[machineId].updatedTime), 'hours') < 1) {
-                dataToSend[machineId] = { ...machineData[machineId] };
+
+        const dataToSend = {};
+        for (let machineId in machineData) {
+            const m = machineData[machineId];
+            if (
+                m.updatedTime &&
+                moment().diff(moment(m.updatedTime), "hours") < 1
+            ) {
+                dataToSend[machineId] = { ...m };
             }
         }
-        await axios.post('https://trackweaving.com/api/v1/machine-logs', {
+        console.log(dataToSend);
+        await axios.post("https://trackweaving.com/api/v1/machine-logs", {
             logs: dataToSend,
             workspaceId: workspaceId,
-            apiKey: "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21"
+            apiKey:
+                "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21"
         });
-        for(let machineId in machineData) {
-            if(machineData[machineId].prevData) {
+
+        // clear prevData after sending
+        for (let machineId in machineData) {
+            if (machineData[machineId].prevData) {
                 machineData[machineId].prevData = null;
             }
         }
-        isDataStorAPICalled = false;
     } catch (error) {
-        console.log(error);
+        console.log("Error in data store interval:", error.message || error);
+    } finally {
         isDataStorAPICalled = false;
     }
 }, 5000);
 
+// ====== EXPRESS SERVER ======
 const PORT = parseInt(process.env.PORT || "3001", 10);
+
+app.get("/health", (req, res) => {
+    res.json({ ok: true, time: new Date(), machines: Object.keys(machineData).length });
+});
+
 app.listen(PORT, () => {
-    console.log(`Loom server on http://localhost:${PORT} started At ${new Date()}`);
-    console.log(`Polling ${LOOM_IP}:${LOOM_PORT} (UNIT_ID=${UNIT_ID}) start=${START_ADDR} count=${COUNT} zeroBased=${ZERO_BASED}`);
-    initAllMachines();
+    console.log(
+        `Loom server on http://localhost:${PORT} started At ${new Date()}`
+    );
+    console.log(
+        `Polling start=${START_ADDR} count=${COUNT} zeroBased=${ZERO_BASED}`
+    );
+    initAllMachines().catch((e) => {
+        console.error("Failed to init machines:", e);
+    });
+});
+
+// ====== GLOBAL ERROR SAFETY NET ======
+
+// Specifically swallow the "TCP Connection Timed Out" crash coming from modbus-serial
+process.on("uncaughtException", (err) => {
+    if (err && err.message && err.message.includes("TCP Connection Timed Out")) {
+        console.error("Ignored uncaught TCP timeout error:", err.message);
+        return;
+    }
+    console.error("Uncaught exception, exiting:", err);
+    process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+    console.error("Unhandled promise rejection:", reason);
 });
 
 // graceful shutdown
 process.on("SIGINT", async () => {
-    try { if (client.isOpen) client.close(); } catch { }
+    console.log("Gracefully shutting down...");
+    for (const client of allClients) {
+        try {
+            if (client.isOpen) client.close();
+        } catch (_) {}
+    }
     process.exit(0);
 });
