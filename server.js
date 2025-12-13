@@ -12,7 +12,7 @@ const START_ADDR = parseInt(process.env.START_ADDR || "5000", 10);
 const COUNT = parseInt(process.env.COUNT || "74", 10);
 const ZERO_BASED = true;
 
-const workspaceId = "690f350453c8c174cb093c60";
+const workspaceId = "693d265bb326f4ae12b2ba26";
 
 const REGISTER = {
     nazon: {
