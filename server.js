@@ -284,7 +284,6 @@ async function pollLoop(machine) {
                 }
 
                 const data = resp.data || [];
-                console.log(`Read data from ${ip}:`, data);
 
                 const reg = REGISTER[displayType];
                 if (
@@ -295,7 +294,6 @@ async function pollLoop(machine) {
                 ) {
                     console.log(`Suspicious zero data from ${ip}:`, data);
                 } else {
-                    console.log(`Data from ${ip}:`, data);
                     processData(machine, data);
                 }
 
@@ -357,7 +355,6 @@ setInterval(async () => {
                 dataToSend[machineId] = { ...m };
             }
         }
-        console.log(dataToSend);
         await axios.post("https://trackweaving.com/api/v1/machine-logs", {
             logs: dataToSend,
             workspaceId: workspaceId,
