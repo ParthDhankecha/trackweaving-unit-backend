@@ -249,6 +249,7 @@ async function pollLoop(machine) {
             console.log(`Connected to ${ip}:${LOOM_PORT} (UNIT_ID=${unitId})`);
             lastError = null;
         } catch (e) {
+            connecting = false;
             lastError = e?.message || String(e);
             console.log(`Connect error for ${ip}:`, lastError);
             try {
@@ -369,7 +370,8 @@ setInterval(async () => {
             }
         }
     } catch (error) {
-        console.log("Error in data store interval:", error.message || error);
+        isDataStorAPICalled = false;
+        console.log(new Date(), "Error in data store interval:", error?.message || error);
     } finally {
         isDataStorAPICalled = false;
     }
