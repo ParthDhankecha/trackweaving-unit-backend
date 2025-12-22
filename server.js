@@ -3,6 +3,13 @@ const express = require("express");
 const axios = require("axios");
 const ModbusRTU = require("modbus-serial");
 const moment = require("moment");
+const https = require("https");
+const axiosInstance = axios.create({
+    timeout: 15000,
+    httpsAgent: new https.Agent({
+        keepAlive: false,
+    }),
+});
 
 const app = express();
 
@@ -161,6 +168,7 @@ function processData(machine, data) {
     if (!machineData[machineId]) {
         initMachineData(machineId, displayType);
     }
+    machineData[machineId].updatedTime = moment().utc().format();
 
     // Handle transitions between running and stopped
     if (machineData[machineId].stop === 0 && stop !== 0) {
@@ -207,7 +215,15 @@ function processData(machine, data) {
 
     machineData[machineId].rawData = data;
     machineData[machineId].shift = at(reg.shift);
-    machineData[machineId].updatedTime = moment().utc().format();
+}
+
+function withTimeout(promise, ms, label) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) =>
+            setTimeout(() => reject(new Error(`${label} timeout`)), ms)
+        )
+    ]);
 }
 
 // ====== POLLING LOOP (per machine) ======
@@ -229,7 +245,7 @@ async function pollLoop(machine) {
         lastError = e?.message || String(e);
         console.log(`Client error on ${ip}:`, lastError);
         try {
-            if (client.isOpen) client.close();
+            if (client.isOpen) client.close(true);
         } catch (_) {}
     });
 
@@ -248,12 +264,13 @@ async function pollLoop(machine) {
             // sometimes throws uncaught on its own TCP timeout.
             console.log(`Connected to ${ip}:${LOOM_PORT} (UNIT_ID=${unitId})`);
             lastError = null;
+            connecting = false;
         } catch (e) {
             connecting = false;
             lastError = e?.message || String(e);
             console.log(`Connect error for ${ip}:`, lastError);
             try {
-                if (client.isOpen) client.close();
+                if (client.isOpen) client.close(true);
             } catch (_) {}
         } finally {
             connecting = false;
@@ -271,12 +288,12 @@ async function pollLoop(machine) {
             if (client.isOpen) {
                 let resp;
                 try {
-                    resp = await client.readHoldingRegisters(start, COUNT);
+                    resp = await withTimeout(client.readHoldingRegisters(start, COUNT), 3000, `Read timeout ${ip}`);
                 } catch (e) {
                     lastError = e?.message || String(e);
                     console.log(`Read error for ${ip}:`, lastError);
                     try {
-                        if (client.isOpen) client.close();
+                        client.close(true);
                     } catch (_) {}
                     // increase backoff
                     backoffMs = Math.min(backoffMs * 2, 10000);
@@ -294,9 +311,8 @@ async function pollLoop(machine) {
                     data[reg.speed - start] === 0
                 ) {
                     console.log(`Suspicious zero data from ${ip}:`, data);
-                } else {
-                    processData(machine, data);
                 }
+                processData(machine, data);
 
                 lastError = null;
                 backoffMs = 1000; // reset backoff on success
@@ -306,8 +322,10 @@ async function pollLoop(machine) {
             console.log(`Unexpected error in pollLoop(${ip}):`, msg);
             lastError = msg;
             try {
-                if (client.isOpen) client.close();
-            } catch (_) {}
+                client.close(true);
+            } catch (_) {
+                try { client.close(); } catch (_) {}
+            }
             backoffMs = Math.min(backoffMs * 2, 10000);
         }
 
@@ -317,35 +335,46 @@ async function pollLoop(machine) {
 
 // ====== INIT ALL MACHINES ======
 async function initAllMachines() {
-    let initData = await axios.post(
-        "https://trackweaving.com/api/v1/machine-logs/machine-list",
-        {
-            workspaceId: workspaceId,
-            apiKey:
-                "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21"
+    let delayMs = 5000;
+
+    while(true) {
+        try {
+            console.log("Fetching machine list...");
+            let initData = await axiosInstance.post(
+                "https://trackweaving.com/api/v1/machine-logs/machine-list",
+                {
+                    workspaceId: workspaceId,
+                    apiKey:
+                        "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21"
+                }
+            );
+            initData = initData.data;
+
+            // preload machineData if backend sends something
+            machineData = initData.data.machineData || {};
+
+            for (let machine of initData.data.machines) {
+                // fire and forget, each has its own loop and connection
+                pollLoop(machine).catch((e) => {
+                    console.error(`pollLoop crashed for machine ${machine.id}:`, e);
+                });
+            }
+            console.log(`Initialized ${initData.data.machines.length} machines.`);
+            return;
+        } catch (error) {
+            console.log("Error fetching machine list:", error?.message || error);
+            console.log(`Retrying in ${delayMs / 1000} seconds...`);
+            await sleep(delayMs);
+            delayMs = Math.min(delayMs * 2, 60000); // exponential backoff up to 1 min
         }
-    );
-
-    initData = initData.data;
-
-    // preload machineData if backend sends something
-    machineData = initData.data.machineData || {};
-
-    for (let machine of initData.data.machines) {
-        // fire and forget, each has its own loop and connection
-        pollLoop(machine).catch((e) => {
-            console.error(`pollLoop crashed for machine ${machine.id}:`, e);
-        });
     }
 }
 
 // ====== PERIODIC DATA PUSH ======
-setInterval(async () => {
-    if (isDataStorAPICalled) return;
+let dataPushDelay = 5000;
 
+async function dataPushLoop() {
     try {
-        isDataStorAPICalled = true;
-
         const dataToSend = {};
         for (let machineId in machineData) {
             const m = machineData[machineId];
@@ -356,7 +385,7 @@ setInterval(async () => {
                 dataToSend[machineId] = { ...m };
             }
         }
-        await axios.post("https://trackweaving.com/api/v1/machine-logs", {
+        await axiosInstance.post("https://trackweaving.com/api/v1/machine-logs", {
             logs: dataToSend,
             workspaceId: workspaceId,
             apiKey:
@@ -369,13 +398,19 @@ setInterval(async () => {
                 machineData[machineId].prevData = null;
             }
         }
+        dataPushDelay = 5000; // reset delay on success
     } catch (error) {
-        isDataStorAPICalled = false;
         console.log(new Date(), "Error in data store interval:", error?.message || error);
-    } finally {
-        isDataStorAPICalled = false;
+        dataPushDelay = Math.min(dataPushDelay * 2, 60000); // exponential backoff up to 1 min
+        if (error.code === "ENOTFOUND" || error.code === "ECONNRESET") {
+            axiosInstance.defaults.httpsAgent.destroy();
+        }
     }
-}, 5000);
+
+    setTimeout(dataPushLoop, dataPushDelay);
+}
+
+dataPushLoop();
 
 // ====== EXPRESS SERVER ======
 const PORT = parseInt(process.env.PORT || "3001", 10);
@@ -417,7 +452,7 @@ process.on("SIGINT", async () => {
     console.log("Gracefully shutting down...");
     for (const client of allClients) {
         try {
-            if (client.isOpen) client.close();
+            if (client.isOpen) client.close(true);
         } catch (_) {}
     }
     process.exit(0);
