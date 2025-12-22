@@ -157,12 +157,9 @@ function processData(machine, data) {
     let speed = at(reg.speed);
     let stop = at(reg.stop);
 
-    // Special handling for chitic displays
-    if (displayType === "chitic") {
-        if (speed > 5) {
-            data[reg.stop - startAddr] = 0;
-            stop = 0;
-        }
+    if (speed > 20) {
+        data[reg.stop - startAddr] = 0;
+        stop = 0;
     }
 
     if (!machineData[machineId]) {
