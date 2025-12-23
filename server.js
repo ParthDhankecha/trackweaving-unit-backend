@@ -308,8 +308,9 @@ async function pollLoop(machine) {
                     data[reg.speed - start] === 0
                 ) {
                     console.log(`Suspicious zero data from ${ip}:`, data);
+                } else {
+                    processData(machine, data);
                 }
-                processData(machine, data);
 
                 lastError = null;
                 backoffMs = 1000; // reset backoff on success
