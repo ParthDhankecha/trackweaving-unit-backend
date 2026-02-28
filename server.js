@@ -18,6 +18,7 @@ const LOOM_PORT = parseInt(process.env.LOOM_PORT || "502", 10);
 const START_ADDR = parseInt(process.env.START_ADDR || "5000", 10);
 const COUNT = parseInt(process.env.COUNT || "74", 10);
 const ZERO_BASED = true;
+const READ_TIMEOUT_MS = parseInt(process.env.READ_TIMEOUT_MS || "7000", 10);
 
 const workspaceId = "693d265bb326f4ae12b2ba26";
 
@@ -234,6 +235,7 @@ async function pollLoop(machine) {
     let backoffMs = 1000;
     let lastError = null;
     let connecting = false;
+    let consecutiveTimeouts = 0;
 
     const ip = machine.ip;
 
@@ -285,13 +287,35 @@ async function pollLoop(machine) {
             if (client.isOpen) {
                 let resp;
                 try {
-                    resp = await withTimeout(client.readHoldingRegisters(start, COUNT), 3000, `Read timeout ${ip}`);
+                    resp = await withTimeout(
+                        client.readHoldingRegisters(start, COUNT),
+                        READ_TIMEOUT_MS,
+                        `Read timeout ${ip}`
+                    );
                 } catch (e) {
                     lastError = e?.message || String(e);
                     console.log(`Read error for ${ip}:`, lastError);
-                    try {
-                        client.close(true);
-                    } catch (_) {}
+
+                    if (lastError.includes("Read timeout")) {
+                        consecutiveTimeouts += 1;
+                    } else {
+                        consecutiveTimeouts = 0;
+                    }
+
+                    if (lastError.includes("Read timeout") || consecutiveTimeouts > 0) {
+                        try {
+                            if (client.isOpen) client.close(true);
+                        } catch (_) {
+                            try { client.close(); } catch (_) {}
+                        }
+                    } else {
+                        try {
+                            client.close(true);
+                        } catch (_) {
+                            try { client.close(); } catch (_) {}
+                        }
+                    }
+
                     // increase backoff
                     backoffMs = Math.min(backoffMs * 2, 10000);
                     await sleep(backoffMs);
@@ -313,6 +337,7 @@ async function pollLoop(machine) {
                 }
 
                 lastError = null;
+                consecutiveTimeouts = 0;
                 backoffMs = 1000; // reset backoff on success
             }
         } catch (err) {
@@ -433,7 +458,14 @@ app.listen(PORT, () => {
 
 // Specifically swallow the "TCP Connection Timed Out" crash coming from modbus-serial
 process.on("uncaughtException", (err) => {
-    if (err && err.message && err.message.includes("TCP Connection Timed Out")) {
+    if (
+        err &&
+        err.message &&
+        (
+            err.message.includes("TCP Connection Timed Out") ||
+            err.message.includes("self.callback is not a function")
+        )
+    ) {
         console.error("Ignored uncaught TCP timeout error:", err.message);
         return;
     }
