@@ -15,12 +15,13 @@ const app = express();
 
 // ====== CONFIG ======
 const LOOM_PORT = parseInt(process.env.LOOM_PORT || "502", 10);
-const START_ADDR = parseInt(process.env.START_ADDR || "5000", 10);
+const START_ADDR = parseInt(process.env.START_ADDR || "1", 10);
 const COUNT = parseInt(process.env.COUNT || "74", 10);
 const ZERO_BASED = true;
 const READ_TIMEOUT_MS = parseInt(process.env.READ_TIMEOUT_MS || "7000", 10);
+const MAX_REGS_PER_READ = parseInt(process.env.MAX_REGS_PER_READ || "60", 10);
 
-const workspaceId = "693d265bb326f4ae12b2ba26";
+const workspaceId = "6a47941530e89397e63fa219";
 
 const REGISTER = {
     nazon: {
@@ -40,8 +41,29 @@ const REGISTER = {
         loomState: 5013,
         speed: 5003,
         efficiency: 5044
+    },
+    pickwell: {
+        stop: 5023,
+        shift: 5005,
+        setPicks: 5002,
+        clothLength: 5006,
+        loomState: 5013,
+        speed: 5003,
+        efficiency: 5044
+    },
+    biana: {
+        stop: 6,
+        shift: 1,
+        speed: 2
     }
 };
+
+const UNIT_IDS = {
+    'nazon': 85,
+    'chitic': 1,
+    'pickwell': 1,
+    'biana': 255
+}
 
 let machineData = {};
 let isDataStorAPICalled = false;
@@ -61,7 +83,9 @@ function initMachineData(machineId, displayType) {
             weft: [],
             feeder: [],
             manual: [],
-            other: []
+            other: [],
+            h1: [],
+            h2: []
         },
         lastStopTime: null,
         lastStartTime: null,
@@ -117,7 +141,7 @@ function setStopData(machineId, displayType) {
                 machineData[machineId].stopsData.other.push(baseEntry);
                 break;
         }
-    } else if (displayType === "chitic") {
+    } else if (["chitic", "pickwell"].includes(displayType)) {
         switch (stopCode) {
             case 1:
                 machineData[machineId].stopsData.warp.push(baseEntry);
@@ -139,6 +163,31 @@ function setStopData(machineId, displayType) {
                 machineData[machineId].stopsData.other.push(baseEntry);
                 break;
         }
+    } else if(displayType === "biana") {
+        switch (stopCode) {
+            case 1:
+                machineData[machineId].stopsData.manual.push(baseEntry);
+                break;
+
+            case 2:
+                machineData[machineId].stopsData.warp.push(baseEntry);
+                break;
+            
+            case 3:
+            case 4:
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+            case 9:
+                machineData[machineId].stopsData.h1.push(baseEntry);
+                break;
+                
+            default:
+                machineData[machineId].stopsData.other.push(baseEntry);
+                break;
+
+        }
     }
 }
 
@@ -158,10 +207,10 @@ function processData(machine, data) {
     let speed = at(reg.speed);
     let stop = at(reg.stop);
 
-    if (speed > 20) {
-        data[reg.stop - startAddr] = 0;
-        stop = 0;
-    }
+    // if (speed > 20) {
+    //     data[reg.stop - startAddr] = 0;
+    //     stop = 0;
+    // }
 
     if (!machineData[machineId]) {
         initMachineData(machineId, displayType);
@@ -193,7 +242,9 @@ function processData(machine, data) {
             weft: [],
             feeder: [],
             manual: [],
-            other: []
+            other: [],
+            h1: [],
+            h2: []
         };
 
         if (machineData[machineId].stop === 0 && stop === 0) {
@@ -204,10 +255,10 @@ function processData(machine, data) {
     machineData[machineId].stop = stop;
 
     // Adjust setPicks and efficiency for some device types
-    if (machine.deviceType === "rs485" || displayType === "chitic") {
+    if (machine.deviceType === "rs485" || ["chitic", "pickwell"].includes(displayType)) {
         data[reg.setPicks - startAddr] = at(reg.setPicks) / 10;
     }
-    if (displayType === "chitic") {
+    if (["chitic", "pickwell"].includes(displayType)) {
         data[reg.efficiency - startAddr] = at(reg.efficiency);
     }
 
@@ -224,15 +275,40 @@ function withTimeout(promise, ms, label) {
     ]);
 }
 
+// Read `count` registers starting at `start` in chunks sized by `MAX_REGS_PER_READ`.
+// Returns an object with a `data` array compatible with `modbus-serial` responses.
+async function readRegistersInChunks(client, start, count, ip) {
+    const chunks = [];
+    let remaining = count;
+    let offset = start;
+
+    while (remaining > 0) {
+        const len = Math.min(remaining, MAX_REGS_PER_READ);
+        const part = await withTimeout(
+            client.readHoldingRegisters(offset, len),
+            READ_TIMEOUT_MS,
+            `Read timeout ${ip}`
+        );
+        const dataPart = part.data || [];
+        chunks.push(...dataPart);
+        offset += len;
+        remaining -= len;
+        // small pause between chunked requests to avoid overwhelming the device
+        await sleep(50);
+    }
+
+    return { data: chunks };
+}
+
 // ====== POLLING LOOP (per machine) ======
 async function pollLoop(machine) {
     const client = new ModbusRTU();
     allClients.add(client);
 
     const displayType = machine.displayType || "nazon";
-    const unitId = displayType === "chitic" ? 1 : 85;
+    let unitId = UNIT_IDS[displayType] || 1;
 
-    let backoffMs = 1000;
+    let backoffMs = 5000;
     let lastError = null;
     let connecting = false;
     let consecutiveTimeouts = 0;
@@ -287,11 +363,16 @@ async function pollLoop(machine) {
             if (client.isOpen) {
                 let resp;
                 try {
-                    resp = await withTimeout(
-                        client.readHoldingRegisters(start, COUNT),
-                        READ_TIMEOUT_MS,
-                        `Read timeout ${ip}`
-                    );
+                    // Use chunked reads when COUNT exceeds MAX_REGS_PER_READ or for biana devices
+                    if (displayType === "biana" || COUNT > MAX_REGS_PER_READ) {
+                        resp = await readRegistersInChunks(client, start, COUNT, ip);
+                    } else {
+                        resp = await withTimeout(
+                            client.readHoldingRegisters(start, COUNT),
+                            READ_TIMEOUT_MS,
+                            `Read timeout ${ip}`
+                        );
+                    }
                 } catch (e) {
                     lastError = e?.message || String(e);
                     console.log(`Read error for ${ip}:`, lastError);
@@ -326,6 +407,7 @@ async function pollLoop(machine) {
 
                 const reg = REGISTER[displayType];
                 if (
+                    displayType !== "biana" &&
                     data.length > 30 &&
                     data[reg.clothLength - start] === 0 &&
                     data[reg.loomState - start] === 0 &&
