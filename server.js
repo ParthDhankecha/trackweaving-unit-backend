@@ -20,7 +20,7 @@ const COUNT = parseInt(process.env.COUNT || "74", 10);
 const ZERO_BASED = true;
 const READ_TIMEOUT_MS = parseInt(process.env.READ_TIMEOUT_MS || "7000", 10);
 
-const workspaceId = "693d265bb326f4ae12b2ba26";
+const workspaceId = "68de43d477ac61e06d4c9f9f";
 
 const REGISTER = {
     nazon: {
@@ -256,9 +256,15 @@ async function pollLoop(machine) {
         if (client.isOpen || connecting) return;
         connecting = true;
         try {
-            console.log(`Connecting to ${ip}:${LOOM_PORT} (UNIT_ID=${unitId})...`);
-            await client.connectTCP(ip, { port: LOOM_PORT });
-            client.setID(unitId);
+            if(machine.deviceType === "rs485") {
+                console.log(`Connecting to ${ip}:${LOOM_PORT} (UNIT_ID=${unitId})...`);
+                await client.connectTelnet(ip, { port: LOOM_PORT });
+                client.setID(unitId);
+            } else {
+                console.log(`Connecting to ${ip}:${LOOM_PORT} (UNIT_ID=${unitId})...`);
+                await client.connectTCP(ip, { port: LOOM_PORT });
+                client.setID(unitId);
+            }
             // IMPORTANT: do NOT set client.setTimeout here; the library
             // sometimes throws uncaught on its own TCP timeout.
             console.log(`Connected to ${ip}:${LOOM_PORT} (UNIT_ID=${unitId})`);
