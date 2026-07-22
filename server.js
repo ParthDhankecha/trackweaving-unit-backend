@@ -16,7 +16,7 @@ const app = express();
 // ====== CONFIG ======
 const LOOM_PORT = parseInt(process.env.LOOM_PORT || "502", 10);
 const START_ADDR = parseInt(process.env.START_ADDR || "1", 10);
-const COUNT = parseInt(process.env.COUNT || "74", 10);
+const COUNT = parseInt(process.env.COUNT || "102", 10);
 const ZERO_BASED = true;
 const READ_TIMEOUT_MS = parseInt(process.env.READ_TIMEOUT_MS || "7000", 10);
 const MAX_REGS_PER_READ = parseInt(process.env.MAX_REGS_PER_READ || "60", 10);
@@ -54,7 +54,8 @@ const REGISTER = {
     biana: {
         stop: 6,
         shift: 1,
-        speed: 2
+        speed: 2,
+        nightSpeed: 72
     }
 };
 
@@ -206,6 +207,10 @@ function processData(machine, data) {
 
     let speed = at(reg.speed);
     let stop = at(reg.stop);
+    let shift = at(reg.shift);
+    if(at(reg.nightSpeed) > 10){
+        shift = 1;
+    }
 
     // if (speed > 20) {
     //     data[reg.stop - startAddr] = 0;
@@ -227,7 +232,7 @@ function processData(machine, data) {
         setStopData(machineId, displayType);
     } else if (
         typeof machineData[machineId].shift === "number" &&
-        at(reg.shift) !== machineData[machineId].shift
+        shift !== machineData[machineId].shift
     ) {
         // shift change
         if (machineData[machineId].stop !== 0 && stop !== 0) {
@@ -262,8 +267,12 @@ function processData(machine, data) {
         data[reg.efficiency - startAddr] = at(reg.efficiency);
     }
 
+    if(displayType === "biana" && shift == 1) {
+        data[0] = 1;
+    }
+
     machineData[machineId].rawData = data;
-    machineData[machineId].shift = at(reg.shift);
+    machineData[machineId].shift = shift;
 }
 
 function withTimeout(promise, ms, label) {
