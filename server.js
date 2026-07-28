@@ -15,13 +15,13 @@ const app = express();
 
 // ====== CONFIG ======
 const LOOM_PORT = parseInt(process.env.LOOM_PORT || "502", 10);
-const START_ADDR = parseInt(process.env.START_ADDR || "1", 10);
-const COUNT = parseInt(process.env.COUNT || "102", 10);
+const START_ADDR = parseInt(process.env.START_ADDR || "5000", 10);
+const COUNT = parseInt(process.env.COUNT || "54", 10);
 const ZERO_BASED = true;
 const READ_TIMEOUT_MS = parseInt(process.env.READ_TIMEOUT_MS || "7000", 10);
 const MAX_REGS_PER_READ = parseInt(process.env.MAX_REGS_PER_READ || "60", 10);
 
-const workspaceId = "6a47941530e89397e63fa219";
+const workspaceId = "6a68446f00c76a09812448c3";
 
 const REGISTER = {
     nazon: {
@@ -264,7 +264,7 @@ function processData(machine, data) {
         data[reg.setPicks - startAddr] = at(reg.setPicks) / 10;
     }
     if (["chitic", "pickwell"].includes(displayType)) {
-        data[reg.efficiency - startAddr] = at(reg.efficiency);
+        data[reg.efficiency - startAddr] = at(reg.efficiency)/10;
     }
 
     if(displayType === "biana" && shift == 1) {
