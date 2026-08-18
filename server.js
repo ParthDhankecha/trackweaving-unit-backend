@@ -4,19 +4,21 @@ const express = require("express");
 const axios = require("axios");
 const moment = require("moment");
 const https = require("https");
-const io = require("socket.io-client");
 
 const app = express();
 app.use(express.json());
 
 const CONFIG = {
     apiBaseUrl: process.env.API_BASE_URL || "https://trackweaving.com/api/v1",
-    workspaceId: process.env.WORKSPACE_ID || "6a6afb6efb89777aa538ebd8",
+    workspaceId: process.env.WORKSPACE_ID || "6a83fcdd606858cf59de3918",
     apiKey: process.env.API_KEY || "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21",
     port: parseInt(process.env.PORT || "3001", 10),
-    dataPushIntervalMs: parseInt(process.env.DATA_PUSH_INTERVAL_MS || "5000",10),
-    fullRefreshIntervalMs: parseInt(process.env.FULL_REFRESH_INTERVAL_MS || "60000",10),
-    socketConnectTimeoutMs: parseInt(process.env.SOCKET_CONNECT_TIMEOUT_MS || "10000",10),
+    /*
+     * Single interval reused for both polling the loom's HMI
+     * over HTTP and pushing collected data upstream.
+     */
+    dataPushIntervalMs: parseInt(process.env.DATA_PUSH_INTERVAL_MS || "7000", 10),
+    hmiPort: parseInt(process.env.HMI_PORT || "9900", 10),
     logVariableChanges: process.env.LOG_VARIABLE_CHANGES === "true",
 };
 
@@ -27,39 +29,6 @@ const axiosInstance = axios.create({
         maxSockets: 10,
     }),
 });
-
-const IDS = {
-    currentShift: 5037,
-    loomSpeed: 407,
-    loomStateCode: 423,
-    stopReasonCode: 427,
-    stopReasonText: 1780,
-    weftDensity: 53,
-    weftDensityDisplay: 1997,
-    weftDensityDisplayInch: 3077,
-    remainingWarp: 4703,
-    warpCompletionDateTime: 9864,
-    lengthMeter: 8302,
-    lengthYard: 8313,
-    picks: 8324,
-    pieces: 8335,
-    shiftSpeed: 8346,
-    efficiency: 8357,
-    totalTimeMinutes: 8368,
-    runtimeMinutes: 8379,
-    totalStopCount: 8390,
-    totalStopMinutes: 8401,
-    h1StopCount: 8412,
-    h1StopMinutes: 8423,
-    h2StopCount: 8434,
-    h2StopMinutes: 8445,
-    warpStopCount: 8456,
-    warpStopMinutes: 8467,
-    otherStopCount: 8478,
-    otherStopMinutes: 8489,
-};
-
-const TRACKED_IDS = new Set(Object.values(IDS));
 
 /*
 |--------------------------------------------------------------------------
@@ -73,7 +42,6 @@ const readers = new Map();
 
 let shuttingDown = false;
 let dataPushTimer = null;
-let machineSyncTimer = null;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -94,7 +62,7 @@ function numberOrNull(value) {
 
     const parsed = Number(value);
 
-    return Number.isFinite(parsed) ? parsed : 0;
+    return Number.isFinite(parsed) ? parsed : null;
 }
 
 function numberWithTwoDecimalsOrNull(value) {
@@ -119,24 +87,27 @@ function textOrNull(value) {
     return text || null;
 }
 
-function normalizeShift(value) {
-    if (value === undefined || value === null) {
-        return null;
-    }
+/*
+ * The HMI reports booleans as the strings "True" / "False".
+ */
+function apiBool(value) {
+    return String(value).trim().toLowerCase() === "true";
+}
 
-    const rawValue = String(value).trim();
-    if (!rawValue) {
-        return null;
-    }
+/*
+ * fabricLength / beginLength come back scaled by 1e6
+ * (e.g. "13628369" -> 13.62 meters).
+ */
+function scaledLengthMeters(value) {
+    const parsed = numberOrNull(value);
 
-    const normalized = rawValue.toUpperCase().replace(/\s+/g, "").replace("班", "").replace("SHIFT", "");
-    const shiftMap = { A: 0, B: 1, C: 2, D: 3, "1": 0, "2": 1, "3": 2, "4": 3 };
+    return parsed === null ? null : Number((parsed / 1000000).toFixed(2));
+}
 
-    return {
-        raw: rawValue,
-        number: shiftMap[normalized] || null,
-        code: normalized
-    };
+function secondsToMinutes(value) {
+    const parsed = numberOrNull(value);
+
+    return parsed === null ? null : Number((parsed / 60).toFixed(2));
 }
 
 /*
@@ -148,9 +119,10 @@ function normalizeShift(value) {
 function createEmptyStopsData() {
     return {
         warp: [],
+        weft: [],
+        feeder: [],
+        manual: [],
         other: [],
-        h1: [],
-        h2: [],
     };
 }
 
@@ -161,8 +133,8 @@ function initMachineData(machine) {
 
     machineData[machineId] = {
         ...existing,
-        displayType: machine.displayType || "haiwell",
-        deviceType: machine.deviceType || "socketio",
+        displayType: machine.displayType || "picanol",
+        deviceType: machine.deviceType || "http",
         ip: machine.ip,
         connected: false,
         connectionError: null,
@@ -172,13 +144,9 @@ function initMachineData(machine) {
         stopsData: existing.stopsData || createEmptyStopsData(),
         lastStopTime: existing.lastStopTime || null,
         lastStartTime: existing.lastStartTime || null,
-        stop: Number.isFinite(Number(existing.stop))
-            ? Number(existing.stop)
-            : 0,
+        stop: existing.stop || null,
         stopReasonText: existing.stopReasonText || null,
-        shift: existing.shift || null,
-        shiftCode: existing.shiftCode || null,
-        shiftRaw: existing.shiftRaw || null,
+        shift: Number.isFinite(Number(existing.shift)) ? Number(existing.shift) : null,
         rawData: existing.rawData || {},
     };
 
@@ -187,63 +155,69 @@ function initMachineData(machine) {
 
 /*
 |--------------------------------------------------------------------------
-| Stoppage classification
+| Stop classification (rapier loom)
 |--------------------------------------------------------------------------
 |
-| We preserve the original stoppage code and text.
-|
-| Text classification is used because the complete code mapping
-| for every possible Haiwell stoppage code is not yet confirmed.
+| Mapped directly from the stop-type flags exposed by
+| .../ProcedureDB/PROCEDURE_FAST_MOTION/MachineStopData/Actual
+| Rapier looms have no h1/h2 weft-side split like airjet looms do,
+| so stops are bucketed by their actual reported cause instead.
 |
 */
-
-function classifyStop(stopCode, stopText) {
-    const text = String(stopText || "").trim().toLowerCase();
-
-    if (/\bh1\b/.test(text) || /c[1-8]\s*h1/.test(text) || /weft.*h1/.test(text)) {
-        return "h1";
-    }
-
-    if (/\bh2\b/.test(text) || /c[1-8]\s*h2/.test(text) || /weft.*h2/.test(text)) {
-        return "h2";
-    }
-
-    if (text.includes("warp") || text.includes("经停") || text.includes("经纱")) {
-        return "warp";
-    }
-
-    void stopCode;
-
-    return "other";
-}
 
 /*
-|--------------------------------------------------------------------------
-| Stop completion
-|--------------------------------------------------------------------------
-*/
+ * Each individual stop reason gets its own code (not just its
+ * bucket/category) so the exact cause is preserved upstream.
+ * Code 0 is reserved to mean "running".
+ */
+const STOP_FLAG_PRIORITY = [
+    ["warpStopType", "warp", 1],
+    ["fillingStopType", "weft", 2],
+    ["fillingBrakeType", "weft", 3],
+    ["bobbinBreakStopType", "feeder", 4],
+    ["mechanicalStopType", "other", 5],
+    ["emergencyStopType", "manual", 6],
+    ["emergencyBrakeType", "manual", 7],
+    ["serviceStopType", "other", 8],
+    ["otherStopType", "other", 9],
+    ["otherBrakeType", "other", 10],
+];
+
+const UNKNOWN_STOP_CODE = 11;
+
+function classifyPicanolStop(stopActual) {
+    if (stopActual) {
+        for (const [flag, category, code] of STOP_FLAG_PRIORITY) {
+            if (apiBool(stopActual[flag])) {
+                return { category, code };
+            }
+        }
+    }
+
+    return { category: "other", code: UNKNOWN_STOP_CODE };
+}
 
 function completeCurrentStop(machineId) {
     const data = machineData[machineId];
 
-    if (!data || !data.lastStopTime) {
+    if (!data || !data.lastStopTime || !data.stop) {
         return;
     }
 
     const now = moment().utc();
     const stopStart = moment(data.lastStopTime);
     const duration = Math.max(0, now.diff(stopStart, "seconds"));
-    const category = classifyStop(data.stop, data.stopReasonText);
+    const category = data.stop;
     const entry = {
         start: data.lastStopTime,
         end: now.format(),
-        statusCode: data.stop,
         category,
+        code: data.stopCode,
         duration,
     };
 
     /*
-     * Same rule as your existing program:
+     * Same rule as the existing program:
      * count only stoppages lasting at least 60 seconds.
      */
     if (duration >= 60) {
@@ -257,103 +231,44 @@ function completeCurrentStop(machineId) {
     data.stopsData[category].push(entry);
 }
 
-/*
-|--------------------------------------------------------------------------
-| Weft density normalization
-|--------------------------------------------------------------------------
-*/
+const ENDPOINTS = {
+    production: { path: "/Machine/ModuleManager/ModuleDB/ProductionMonitoring", key: "ProductionMonitoring" },
+    shift: { path: "/Machine/ModuleManager/ModuleDB/ProductionMonitoring/currentShift", key: "currentShift" },
+    density: { path: "/Machine/pickDensityPerMeter", key: "pickDensityPerMeter" },
+    warp: { path: "/Machine/ModuleManager/ModuleDB/EloRight/warpOutPrediction", key: "warpOutPrediction" },
+    stopActual: { path: "/Machine/ProcedureManager/ProcedureDB/PROCEDURE_FAST_MOTION/MachineStopData/Actual", key: "Actual" },
+};
 
-function getWeftDensity(values) {
-    const rawDensity = numberOrNull(values.get(IDS.weftDensity));
-    if (rawDensity !== null) {
-        return {
-            value: rawDensity,
-            sourceId: IDS.weftDensity,
-            rawValue: values.get(IDS.weftDensity),
-        };
-    }
-
-    const displayDensity = numberOrNull(values.get(IDS.weftDensityDisplay));
-
-    if (displayDensity !== null) {
-        return {
-            value: displayDensity * 100,
-            sourceId: IDS.weftDensityDisplay,
-            rawValue: values.get(IDS.weftDensityDisplay),
-        };
-    }
-
-    return {
-        value: null,
-        sourceId: null,
-        rawValue: null,
-    };
-}
-
-/*
-|--------------------------------------------------------------------------
-| Machine state calculation
-|--------------------------------------------------------------------------
-*/
-
-function getMachineState(values) {
-    const speed = numberOrNull(values.get(IDS.loomSpeed));
-    const stateCode = integerOrNull(values.get(IDS.loomStateCode));
-    let running = null;
-
-    /*
-     * The panel project treats state >= 20
-     * as running.
-     */
-    if(speed !== null && speed > 20) {
-        running = true;
-    } else if (stateCode !== null) {
-        running = stateCode >= 20;
-    } else if (speed !== null) {
-        running = speed > 0;
-    }
-
-    return {
-        speed,
-        stateCode,
-        running,
-        status: running === true ? "RUNNING" : running === false ? "STOPPED": "UNKNOWN",
-    };
-}
-
-/*
-|--------------------------------------------------------------------------
-| Haiwell reader
-|--------------------------------------------------------------------------
-*/
-
-class HaiwellMachineReader {
+class PicanolMachineReader {
     constructor(machine) {
         this.machine = machine;
         this.machineId = String(machine.id);
-        this.hmiUrl = this.createHmiUrl(machine);
-        this.socket = null;
-        this.values = new Map();
-        this.updatedAt = new Map();
-        this.fullRefreshTimer = null;
+        this.baseUrl = this.createBaseUrl(machine);
+        this.pollTimer = null;
+        this.polling = false;
         this.destroyed = false;
         this.lastPayloadAt = null;
+        this.lastError = null;
     }
 
-    createHmiUrl(machine) {
+    createBaseUrl(machine) {
         if (machine.hmiUrl) {
-            return machine.hmiUrl;
+            return String(machine.hmiUrl).replace(/\/+$/, "");
         }
 
         if (!machine.ip) {
             throw new Error(`Machine ${machine.id} has no IP address`);
         }
 
-        if (String(machine.ip).startsWith("http://") || String(machine.ip).startsWith("https://")) {
-            return String(machine.ip);
+        const ip = String(machine.ip);
+
+        if (ip.startsWith("http://") || ip.startsWith("https://")) {
+            return ip.replace(/\/+$/, "");
         }
 
-        return `http://${machine.ip}`;
+        const hasPort = /:\d+$/.test(ip);
+
+        return `http://${ip}${hasPort ? "" : `:${CONFIG.hmiPort}`}`;
     }
 
     start() {
@@ -363,84 +278,47 @@ class HaiwellMachineReader {
 
         initMachineData(this.machine);
 
-        this.connect();
+        this.poll();
+
+        this.pollTimer = setInterval(() => this.poll(), CONFIG.dataPushIntervalMs);
     }
 
-    connect() {
-        if (this.destroyed || this.socket) {
+    async fetchPath({ path, key }) {
+        const response = await axiosInstance.get(`${this.baseUrl}${path}`);
+        const body = response.data;
+
+        return body && Object.prototype.hasOwnProperty.call(body, key) ? body[key] : body;
+    }
+
+    async poll() {
+        if (this.destroyed || this.polling) {
             return;
         }
-        console.log(`[${this.machineId}] Connecting to ${this.hmiUrl}`);
-        const socket = io(this.hmiUrl, {
-            path: "/socket.io",
-            transports: ["websocket"],
-            forceNew: true,
-            reconnection: true,
-            reconnectionAttempts: Infinity,
-            reconnectionDelay: 1000,
-            reconnectionDelayMax: 10000,
-            timeout: CONFIG.socketConnectTimeoutMs,
-        });
 
-        this.socket = socket;
+        this.polling = true;
 
-        /*
-         * Older Socket.IO v2 fallback.
-         *
-         * We intercept the raw packet because some
-         * Haiwell builds package events differently.
-         */
-        const originalOnevent = socket.onevent;
+        try {
+            const [production, shift, density, warp, stopActual] = await Promise.all([
+                this.fetchPath(ENDPOINTS.production),
+                this.fetchPath(ENDPOINTS.shift),
+                this.fetchPath(ENDPOINTS.density),
+                this.fetchPath(ENDPOINTS.warp),
+                this.fetchPath(ENDPOINTS.stopActual),
+            ]);
 
-        socket.onevent = (packet) => {
-            try {
-                const packetData = Array.isArray(packet && packet.data)
-                    ? packet.data
-                    : [];
+            this.lastPayloadAt = new Date().toISOString();
+            this.lastError = null;
 
-                const eventName = packetData[0];
-                if (eventName === "return var to browser") {
-                    const payloads = packetData.slice(1);
-                    for (const payload of payloads) {
-                        this.storePayload(payload);
-                    }
-                }
-            } catch (error) {
-                console.error(
-                    `[${this.machineId}] Incoming packet error:`,
-                    error.message,
-                );
+            if (CONFIG.logVariableChanges) {
+                console.log(`[${this.machineId}] production=${JSON.stringify(production)}`);
+                console.log(`[${this.machineId}] shift=${JSON.stringify(shift)}`);
+                console.log(`[${this.machineId}] stopActual=${JSON.stringify(stopActual)}`);
             }
 
-            return originalOnevent.call(socket, packet);
-        };
+            this.processMachineData({ production, shift, density, warp, stopActual });
+        } catch (error) {
+            this.lastError = error.message;
 
-        socket.on("connect", () => {
-            const state = machineData[this.machineId];
-
-            state.connected = true;
-            state.connectionError = null;
-            state.socketId = socket.id;
-
-            console.log(`[${this.machineId}] Connected: ${socket.id}`);
-
-            this.requestAllVariables();
-
-            this.startFullRefreshTimer();
-        });
-
-        socket.on("disconnect", (reason) => {
-            const state = machineData[this.machineId];
-
-            if (state) {
-                state.connected = false;
-                state.connectionError = reason;
-            }
-
-            console.log(`[${this.machineId}] Disconnected: ${reason}`);
-        });
-
-        socket.on("connect_error", (error) => {
             const state = machineData[this.machineId];
 
             if (state) {
@@ -448,199 +326,127 @@ class HaiwellMachineReader {
                 state.connectionError = error.message;
             }
 
-            console.log(
-                `[${this.machineId}] Connection error: ${error.message}`,
-            );
-        });
-
-        socket.on("reconnect", () => {
-            console.log(`[${this.machineId}] Reconnected`);
-
-            this.requestAllVariables();
-        });
-    }
-
-    requestAllVariables() {
-        if (!this.socket || !this.socket.connected) {
-            return;
-        }
-
-        this.socket.emit("get all variables");
-    }
-
-    startFullRefreshTimer() {
-        if (this.fullRefreshTimer) {
-            clearInterval(this.fullRefreshTimer);
-        }
-
-        this.fullRefreshTimer = setInterval(() => {
-            this.requestAllVariables();
-        }, CONFIG.fullRefreshIntervalMs);
-    }
-
-    storePayload(payload) {
-        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-            return;
-        }
-
-        const now = Date.now();
-
-        let relevantValueChanged = false;
-
-        for (const [idText, rawValue] of Object.entries(payload)) {
-            const id = Number(idText);
-
-            if (!Number.isInteger(id)) {
-                continue;
-            }
-
-            const previous = this.values.get(id);
-            const changed = !this.values.has(id) || previous !== rawValue;
-            this.values.set(id, rawValue);
-            this.updatedAt.set(id, now);
-            if (TRACKED_IDS.has(id) && changed) {
-                relevantValueChanged = true;
-
-                if (CONFIG.logVariableChanges) {
-                    console.log(
-                        `[${this.machineId}] ${id} = ${JSON.stringify(rawValue)}`,
-                    );
-                }
-            }
-        }
-
-        this.lastPayloadAt = new Date().toISOString();
-
-        /*
-         * Process immediately when a tracked value changes.
-         */
-        if (relevantValueChanged) {
-            this.processMachineData();
+            console.error(`[${this.machineId}] Poll error:`, error.message);
+        } finally {
+            this.polling = false;
         }
     }
 
-    processMachineData() {
+    processMachineData({ production, shift, density, warp, stopActual }) {
         const state = machineData[this.machineId] || initMachineData(this.machine);
         const nowUtc = moment().utc().format();
-        const machineState = getMachineState(this.values);
-        const shiftInfo = normalizeShift(this.values.get(IDS.currentShift));
-        const currentShift = shiftInfo ? shiftInfo.number : null;
-        const currentShiftCode = shiftInfo ? shiftInfo.code : null;
-        const currentShiftRaw = shiftInfo ? shiftInfo.raw : null;
-        const stopReasonCode = integerOrNull(this.values.get(IDS.stopReasonCode));
-        const stopReasonText = textOrNull(this.values.get(IDS.stopReasonText));
-        let currentStop = 0;
 
-        if (machineState.running === false) {
-            currentStop = stopReasonCode || machineState.stateCode || 1;
-        }
+        const running = textOrNull(production && production.currentProductionState) === "RUNNING";
+        const stopInfo = running ? null : classifyPicanolStop(stopActual);
+        const currentStop = stopInfo ? stopInfo.category : null;
+        const currentStopCode = running ? 0 : stopInfo.code;
 
-        if (state.stop === 0 && currentStop !== 0) {
+        if (!state.stop && currentStop) {
             state.lastStopTime = nowUtc;
-            state.stopReasonText = stopReasonText;
         }
-        if (state.stop !== 0 && currentStop === 0) {
+        if (state.stop && !currentStop) {
             state.lastStartTime = nowUtc;
             completeCurrentStop(this.machineId);
             state.lastStopTime = null;
         }
-        if (state.stop !== 0 && currentStop !== 0 && (state.stop !== currentStop || (stopReasonText && state.stopReasonText !== stopReasonText))) {
+        if (state.stop && currentStop && state.stop !== currentStop) {
             completeCurrentStop(this.machineId);
             state.lastStopTime = nowUtc;
         }
 
-        const previousShiftRaw = state.shiftRaw;
-        const panelShiftChanged = currentShiftRaw !== null && previousShiftRaw !== null && String(currentShiftRaw) !== String(previousShiftRaw);
+        const currentShiftId = integerOrNull(production && production.currentShiftId);
+        const previousShiftId = state.shift;
+        const shiftChanged = currentShiftId !== null && previousShiftId !== null && currentShiftId !== previousShiftId;
 
-        if (panelShiftChanged) {
-            console.log(`[${this.machineId}] Shift changed: ` + `${previousShiftRaw} -> ${currentShiftRaw}`);
-            if (state.stop !== 0 && currentStop !== 0) {
+        if (shiftChanged) {
+            console.log(`[${this.machineId}] Shift changed: ${previousShiftId} -> ${currentShiftId}`);
+
+            if (state.stop && currentStop) {
                 completeCurrentStop(this.machineId);
                 state.lastStopTime = nowUtc;
             }
+
             state.prevData = clone(state);
             state.stopCount = 0;
             state.stopsData = createEmptyStopsData();
-            if (currentStop === 0) {
+
+            if (!currentStop) {
                 state.lastStartTime = nowUtc;
             }
         }
 
         state.stop = currentStop;
-        state.stopReasonCode = stopReasonCode;
-        state.stopReasonText = stopReasonText;
-        if(shiftInfo) {
-            state.shiftCode = currentShiftCode;
-            state.shiftRaw = currentShiftRaw;
-        }
-        state.shift = currentShift;
+        state.stopCode = currentStopCode;
+        state.stopReasonText = currentStop;
+        state.shift = currentShiftId;
         state.updatedTime = nowUtc;
         state.lastDataTime = this.lastPayloadAt;
-        state.connected = Boolean(this.socket && this.socket.connected);
+        state.connected = true;
         state.connectionError = null;
-        state.rawData = this.buildRawData();
+        state.rawData = this.buildRawData({ production, shift, density, warp, currentStop, currentStopCode });
     }
 
-    buildRawData() {
-        const density = getWeftDensity(this.values);
-        const shiftInfo = normalizeShift(this.values.get(IDS.currentShift));
-        let rawData = [
-            shiftInfo ? shiftInfo.number : null,
-            integerOrNull(this.values.get(IDS.stopReasonCode)) ? integerOrNull(this.values.get(IDS.stopReasonCode)) : 0,
-            textOrNull(this.values.get(IDS.stopReasonText)) ? textOrNull(this.values.get(IDS.stopReasonText)) : '',
-            numberOrNull(this.values.get(IDS.loomSpeed)),
-            numberOrNull(this.values.get(IDS.weftDensityDisplay)),
-            integerOrNull(this.values.get(IDS.remainingWarp)),
-            textOrNull(this.values.get(IDS.warpCompletionDateTime)),
-            numberWithTwoDecimalsOrNull(this.values.get(IDS.lengthMeter)),
-            integerOrNull(this.values.get(IDS.picks)),
-            numberWithTwoDecimalsOrNull(this.values.get(IDS.efficiency)),
-            integerOrNull(this.values.get(IDS.runtimeMinutes)),
-            integerOrNull(this.values.get(IDS.warpStopCount)),
-            integerOrNull(this.values.get(IDS.warpStopMinutes)),
-            integerOrNull(this.values.get(IDS.h1StopCount)),
-            integerOrNull(this.values.get(IDS.h1StopMinutes)),
-            integerOrNull(this.values.get(IDS.h2StopCount)),
-            integerOrNull(this.values.get(IDS.h2StopMinutes)),
-            integerOrNull(this.values.get(IDS.otherStopCount)),
-            integerOrNull(this.values.get(IDS.otherStopMinutes))
-       ];
+    buildRawData({ production, shift, density, warp, currentStop, currentStopCode }) {
+        const efficiency = shift && shift.elapsedTime && shift.timeNormal ? ((shift.timeNormal / shift.elapsedTime) * 100).toFixed(2) : null;
+        const runtimeSeconds = numberOrNull(shift && shift.timeNormal);
+        const remainingWarpSeconds = numberOrNull(warp && warp.remainingWarpTimePrediction);
 
-       return rawData;
+        return [
+            integerOrNull(production && production.currentShiftId),
+            textOrNull(production && production.currentArticleName),
+            currentStopCode,
+            runtimeSeconds === null ? null : Number((runtimeSeconds / 60).toFixed(2)),
+            efficiency === null ? null : Number((efficiency / 10).toFixed(2)),
+            numberOrNull(density),
+            scaledLengthMeters(shift && shift.fabricLength),
+            integerOrNull(shift && shift.pickCounter),
+            numberWithTwoDecimalsOrNull(warp && warp.remainingWarpLength),
+            numberWithTwoDecimalsOrNull(warp && warp.initialWarpLength),
+            remainingWarpSeconds === null
+                ? null
+                : moment().utc().add(remainingWarpSeconds, "seconds").format(),
+            integerOrNull(shift && shift.WarpStopCounter),
+            secondsToMinutes(shift && shift.WarpStopTimer),
+            integerOrNull(shift && shift.FillingStopCounter),
+            secondsToMinutes(shift && shift.FillingStopTimer),
+            integerOrNull(shift && shift.BobbinStopCounter),
+            secondsToMinutes(shift && shift.BobbinStopTimer),
+            integerOrNull(shift && shift.HandStopCounter),
+            secondsToMinutes(shift && shift.HandStopTimer),
+            integerOrNull(shift && shift.OtherStopCounter),
+            secondsToMinutes(shift && shift.OtherStopTimer),
+        ];
     }
 
     getHealth() {
-        const machineState = machineData[this.machineId];
+        const state = machineData[this.machineId];
 
         return {
             machineId: this.machineId,
             ip: this.machine.ip,
-            hmiUrl: this.hmiUrl,
-            connected: Boolean(this.socket && this.socket.connected),
-            socketId: this.socket ? this.socket.id : null,
+            baseUrl: this.baseUrl,
+            connected: Boolean(state && state.connected),
             lastPayloadAt: this.lastPayloadAt,
-            receivedVariableCount: this.values.size,
-            connectionError: machineState ? machineState.connectionError : null,
+            lastError: this.lastError,
+            connectionError: state ? state.connectionError : null,
         };
     }
 
     updateMachine(machine) {
         this.machine = machine;
 
-        const newUrl = this.createHmiUrl(machine);
+        const newBaseUrl = this.createBaseUrl(machine);
 
         /*
-         * Reconnect only when the HMI URL changed.
+         * Reconnect only when the HMI address changed.
          */
-        if (newUrl !== this.hmiUrl) {
-            console.log(
-                `[${this.machineId}] HMI address changed from ${this.hmiUrl} to ${newUrl}`,
-            );
+        if (newBaseUrl !== this.baseUrl) {
+            console.log(`[${this.machineId}] HMI address changed from ${this.baseUrl} to ${newBaseUrl}`);
 
             this.stop();
 
             this.destroyed = false;
-            this.hmiUrl = newUrl;
+            this.baseUrl = newBaseUrl;
 
             this.start();
         }
@@ -649,24 +455,10 @@ class HaiwellMachineReader {
     stop() {
         this.destroyed = true;
 
-        if (this.fullRefreshTimer) {
-            clearInterval(this.fullRefreshTimer);
+        if (this.pollTimer) {
+            clearInterval(this.pollTimer);
 
-            this.fullRefreshTimer = null;
-        }
-
-        if (this.socket) {
-            try {
-                this.socket.removeAllListeners();
-                this.socket.close();
-            } catch (error) {
-                console.error(
-                    `[${this.machineId}] Socket close error:`,
-                    error.message,
-                );
-            }
-
-            this.socket = null;
+            this.pollTimer = null;
         }
 
         const state = machineData[this.machineId];
@@ -683,12 +475,10 @@ class HaiwellMachineReader {
 |--------------------------------------------------------------------------
 */
 
-function isHaiwellMachine(machine) {
+function isPicanolMachine(machine) {
     const displayType = String(machine.displayType || "").toLowerCase();
 
-    const deviceType = String(machine.deviceType || "").toLowerCase();
-
-    return (["haiwell"].includes(displayType));
+    return displayType === "picanol";
 }
 
 /*
@@ -733,16 +523,16 @@ async function syncMachines() {
         }
     }
 
-    const haiwellMachines = machines.filter(isHaiwellMachine);
+    const picanolMachines = machines.filter(isPicanolMachine);
 
     const activeMachineIds = new Set(
-        haiwellMachines.map((machine) => String(machine.id)),
+        picanolMachines.map((machine) => String(machine.id)),
     );
 
     /*
      * Add or update readers.
      */
-    for (const machine of haiwellMachines) {
+    for (const machine of picanolMachines) {
         const machineId = String(machine.id);
         initMachineData(machine);
         const existingReader = readers.get(machineId);
@@ -752,7 +542,7 @@ async function syncMachines() {
             continue;
         }
         try {
-            const reader = new HaiwellMachineReader(machine);
+            const reader = new PicanolMachineReader(machine);
             readers.set(machineId, reader);
             reader.start();
         } catch (error) {
@@ -775,7 +565,7 @@ async function syncMachines() {
         }
     }
 
-    console.log(`Haiwell machines active: ${readers.size}`);
+    console.log(`Picanol machines active: ${readers.size}`);
 }
 
 /*
@@ -901,60 +691,6 @@ async function dataPushLoop() {
     dataPushTimer = setTimeout(dataPushLoop, dataPushDelay);
 }
 
-/*
-|--------------------------------------------------------------------------
-| Express health APIs
-|--------------------------------------------------------------------------
-*/
-
-app.get("/health", (req, res) => {
-    const machineHealth = Array.from(readers.values()).map((reader) =>
-        reader.getHealth(),
-    );
-
-    const connectedMachines = machineHealth.filter((machine) => machine.connected).length;
-
-    res.json({
-        ok: true,
-        time: new Date(),
-        uptimeSeconds: Math.floor(process.uptime()),
-        totalMachines: machineHealth.length,
-        connectedMachines,
-        disconnectedMachines: machineHealth.length - connectedMachines,
-        machines: machineHealth,
-    });
-});
-
-app.get("/health/:machineId", (req, res) => {
-    const reader = readers.get(String(req.params.machineId));
-
-    if (!reader) {
-        return res.status(404).json({
-            ok: false,
-            message: "Machine reader not found",
-        });
-    }
-
-    return res.json({
-        ok: true,
-        health: reader.getHealth(),
-        data: machineData[String(req.params.machineId)] || null,
-    });
-});
-
-app.get("/machines", (req, res) => {
-    res.json({
-        ok: true,
-        machineData,
-    });
-});
-
-/*
-|--------------------------------------------------------------------------
-| Startup validation
-|--------------------------------------------------------------------------
-*/
-
 function validateConfig() {
     if (!CONFIG.workspaceId) {
         console.warn("WARNING: WORKSPACE_ID is empty");
@@ -964,12 +700,6 @@ function validateConfig() {
         console.warn("WARNING: API_KEY is empty");
     }
 }
-
-/*
-|--------------------------------------------------------------------------
-| Graceful shutdown
-|--------------------------------------------------------------------------
-*/
 
 async function shutdown(signal) {
     if (shuttingDown) {
@@ -984,12 +714,6 @@ async function shutdown(signal) {
         clearTimeout(dataPushTimer);
 
         dataPushTimer = null;
-    }
-
-    if (machineSyncTimer) {
-        clearInterval(machineSyncTimer);
-
-        machineSyncTimer = null;
     }
 
     for (const reader of readers.values()) {
@@ -1032,10 +756,9 @@ process.on("unhandledRejection", (reason) => {
 validateConfig();
 
 app.listen(CONFIG.port, async () => {
-    console.log(`Haiwell gateway running on http://localhost:${CONFIG.port}`);
+    console.log(`Picanol gateway running on http://localhost:${CONFIG.port}`);
     console.log(`API: ${CONFIG.apiBaseUrl}`);
-    console.log("Mode: application-level read-only");
-    console.log("No SetById or page navigation is used");
+    console.log("Mode: HTTP polling, read-only");
 
     await initAllMachines();
 
