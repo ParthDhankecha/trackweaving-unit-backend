@@ -237,6 +237,7 @@ const ENDPOINTS = {
     density: { path: "/Machine/pickDensityPerMeter", key: "pickDensityPerMeter" },
     warp: { path: "/Machine/ModuleManager/ModuleDB/EloRight/warpOutPrediction", key: "warpOutPrediction" },
     stopActual: { path: "/Machine/ProcedureManager/ProcedureDB/PROCEDURE_FAST_MOTION/MachineStopData/Actual", key: "Actual" },
+    machineDetails: { path: "/Machine", key: "Machine" },
 };
 
 class PicanolMachineReader {
@@ -298,13 +299,18 @@ class PicanolMachineReader {
         this.polling = true;
 
         try {
-            const [production, shift, density, warp, stopActual] = await Promise.all([
+            let [production, shift, density, warp, stopActual, machineDetails] = await Promise.all([
                 this.fetchPath(ENDPOINTS.production),
                 this.fetchPath(ENDPOINTS.shift),
                 this.fetchPath(ENDPOINTS.density),
                 this.fetchPath(ENDPOINTS.warp),
                 this.fetchPath(ENDPOINTS.stopActual),
+                this.fetchPath(ENDPOINTS.machineDetails)
             ]);
+
+            if(density !== null && density !== undefined){
+                density = Math.round(density / 39.3701); // Convert picks per meter to picks per inch
+            }
 
             this.lastPayloadAt = new Date().toISOString();
             this.lastError = null;
@@ -315,7 +321,7 @@ class PicanolMachineReader {
                 console.log(`[${this.machineId}] stopActual=${JSON.stringify(stopActual)}`);
             }
 
-            this.processMachineData({ production, shift, density, warp, stopActual });
+            this.processMachineData({ production, shift, density, warp, stopActual, machineDetails });
         } catch (error) {
             this.lastError = error.message;
 
@@ -332,7 +338,7 @@ class PicanolMachineReader {
         }
     }
 
-    processMachineData({ production, shift, density, warp, stopActual }) {
+    processMachineData({ production, shift, density, warp, stopActual, machineDetails }) {
         const state = machineData[this.machineId] || initMachineData(this.machine);
         const nowUtc = moment().utc().format();
 
@@ -383,10 +389,10 @@ class PicanolMachineReader {
         state.lastDataTime = this.lastPayloadAt;
         state.connected = true;
         state.connectionError = null;
-        state.rawData = this.buildRawData({ production, shift, density, warp, currentStop, currentStopCode });
+        state.rawData = this.buildRawData({ production, shift, density, warp, currentStop, currentStopCode, machineDetails });
     }
 
-    buildRawData({ production, shift, density, warp, currentStop, currentStopCode }) {
+    buildRawData({ production, shift, density, warp, currentStop, currentStopCode, machineDetails }) {
         const efficiency = shift && shift.elapsedTime && shift.timeNormal ? ((shift.timeNormal / shift.elapsedTime) * 100).toFixed(2) : null;
         const runtimeSeconds = numberOrNull(shift && shift.timeNormal);
         const remainingWarpSeconds = numberOrNull(warp && warp.remainingWarpTimePrediction);
@@ -396,7 +402,7 @@ class PicanolMachineReader {
             textOrNull(production && production.currentArticleName),
             currentStopCode,
             runtimeSeconds === null ? null : Number((runtimeSeconds / 60).toFixed(2)),
-            efficiency === null ? null : Number((efficiency / 10).toFixed(2)),
+            efficiency === null ? null : Number(efficiency),
             numberOrNull(density),
             scaledLengthMeters(shift && shift.fabricLength),
             integerOrNull(shift && shift.pickCounter),
@@ -415,6 +421,7 @@ class PicanolMachineReader {
             secondsToMinutes(shift && shift.HandStopTimer),
             integerOrNull(shift && shift.OtherStopCounter),
             secondsToMinutes(shift && shift.OtherStopTimer),
+            integerOrNull(machineDetails && machineDetails.machineSpeed),
         ];
     }
 
@@ -478,7 +485,7 @@ class PicanolMachineReader {
 function isPicanolMachine(machine) {
     const displayType = String(machine.displayType || "").toLowerCase();
 
-    return displayType === "picanol";
+    return displayType === "picanolrapier";
 }
 
 /*
