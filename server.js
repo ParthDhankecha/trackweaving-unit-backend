@@ -21,7 +21,7 @@ const ZERO_BASED = true;
 const READ_TIMEOUT_MS = parseInt(process.env.READ_TIMEOUT_MS || "7000", 10);
 const MAX_REGS_PER_READ = parseInt(process.env.MAX_REGS_PER_READ || "60", 10);
 
-const workspaceId = "6a547a54063a8a083425f7dd";
+const workspaceId = "6a87e9bf6304ea342e68cf5d";
 
 const REGISTER = {
     nazon: {

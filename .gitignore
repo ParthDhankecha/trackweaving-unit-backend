@@ -1,3 +1,5 @@
 trackweaving.exe
 node_modules/
 .DS_Store
+test/
+shift-variable-output/
