@@ -4,6 +4,7 @@ const express = require("express");
 const axios = require("axios");
 const moment = require("moment");
 const https = require("https");
+const { readItemaMachine } = require("./itema");
 
 const app = express();
 app.use(express.json());
@@ -14,14 +15,13 @@ const CONFIG = {
     apiKey: process.env.API_KEY || "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21",
     port: parseInt(process.env.PORT || "3001", 10),
     /*
-     * Single interval reused for both polling the loom's HMI
-     * over HTTP and pushing collected data upstream.
+     * Single interval reused for both polling the loom over TCP
+     * and pushing collected data upstream.
      */
     dataPushIntervalMs: parseInt(process.env.DATA_PUSH_INTERVAL_MS || "7000", 10),
-    hmiPort: parseInt(process.env.HMI_PORT || "9900", 10),
     logVariableChanges: process.env.LOG_VARIABLE_CHANGES === "true",
 };
-
+    
 const axiosInstance = axios.create({
     timeout: 15000,
     httpsAgent: new https.Agent({
@@ -51,10 +51,6 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 |--------------------------------------------------------------------------
 */
 
-function clone(value) {
-    return JSON.parse(JSON.stringify(value));
-}
-
 function numberOrNull(value) {
     if (value === undefined || value === null || value === "") {
         return null;
@@ -75,33 +71,6 @@ function integerOrNull(value) {
     const parsed = numberOrNull(value);
 
     return parsed === null ? null : Math.trunc(parsed);
-}
-
-function textOrNull(value) {
-    if (value === undefined || value === null) {
-        return null;
-    }
-
-    const text = String(value).trim();
-
-    return text || null;
-}
-
-/*
- * The HMI reports booleans as the strings "True" / "False".
- */
-function apiBool(value) {
-    return String(value).trim().toLowerCase() === "true";
-}
-
-/*
- * fabricLength / beginLength come back scaled by 1e6
- * (e.g. "13628369" -> 13.62 meters).
- */
-function scaledLengthMeters(value) {
-    const parsed = numberOrNull(value);
-
-    return parsed === null ? null : Number((parsed / 1000000).toFixed(2));
 }
 
 function secondsToMinutes(value) {
@@ -133,8 +102,8 @@ function initMachineData(machine) {
 
     machineData[machineId] = {
         ...existing,
-        displayType: machine.displayType || "picanol",
-        deviceType: machine.deviceType || "http",
+        displayType: machine.displayType || "itema",
+        deviceType: machine.deviceType || "tcp",
         ip: machine.ip,
         connected: false,
         connectionError: null,
@@ -146,55 +115,10 @@ function initMachineData(machine) {
         lastStartTime: existing.lastStartTime || null,
         stop: existing.stop || null,
         stopReasonText: existing.stopReasonText || null,
-        shift: Number.isFinite(Number(existing.shift)) ? Number(existing.shift) : null,
         rawData: existing.rawData || {},
     };
 
     return machineData[machineId];
-}
-
-/*
-|--------------------------------------------------------------------------
-| Stop classification (rapier loom)
-|--------------------------------------------------------------------------
-|
-| Mapped directly from the stop-type flags exposed by
-| .../ProcedureDB/PROCEDURE_FAST_MOTION/MachineStopData/Actual
-| Rapier looms have no h1/h2 weft-side split like airjet looms do,
-| so stops are bucketed by their actual reported cause instead.
-|
-*/
-
-/*
- * Each individual stop reason gets its own code (not just its
- * bucket/category) so the exact cause is preserved upstream.
- * Code 0 is reserved to mean "running".
- */
-const STOP_FLAG_PRIORITY = [
-    ["warpStopType", "warp", 1],
-    ["fillingStopType", "weft", 2],
-    ["fillingBrakeType", "weft", 3],
-    ["bobbinBreakStopType", "feeder", 4],
-    ["mechanicalStopType", "other", 5],
-    ["emergencyStopType", "manual", 6],
-    ["emergencyBrakeType", "manual", 7],
-    ["serviceStopType", "other", 8],
-    ["otherStopType", "other", 9],
-    ["otherBrakeType", "other", 10],
-];
-
-const UNKNOWN_STOP_CODE = 11;
-
-function classifyPicanolStop(stopActual) {
-    if (stopActual) {
-        for (const [flag, category, code] of STOP_FLAG_PRIORITY) {
-            if (apiBool(stopActual[flag])) {
-                return { category, code };
-            }
-        }
-    }
-
-    return { category: "other", code: UNKNOWN_STOP_CODE };
 }
 
 function completeCurrentStop(machineId) {
@@ -231,45 +155,30 @@ function completeCurrentStop(machineId) {
     data.stopsData[category].push(entry);
 }
 
-const ENDPOINTS = {
-    production: { path: "/Machine/ModuleManager/ModuleDB/ProductionMonitoring", key: "ProductionMonitoring" },
-    shift: { path: "/Machine/ModuleManager/ModuleDB/ProductionMonitoring/currentShift", key: "currentShift" },
-    density: { path: "/Machine/pickDensityPerMeter", key: "pickDensityPerMeter" },
-    warp: { path: "/Machine/ModuleManager/ModuleDB/EloRight/warpOutPrediction", key: "warpOutPrediction" },
-    stopActual: { path: "/Machine/ProcedureManager/ProcedureDB/PROCEDURE_FAST_MOTION/MachineStopData/Actual", key: "Actual" },
-    machineDetails: { path: "/Machine", key: "Machine" },
-};
+/*
+|--------------------------------------------------------------------------
+| Itema machine reader (TCP, IDT protocol)
+|--------------------------------------------------------------------------
+|
+| Live stop category/detail codes (IDT 5) aren't mapped to
+| warp/weft/feeder/manual/other yet - every stop is bucketed as
+| "other" until the code table is confirmed. Shift-cumulative
+| per-category counters (IDT 200) are unaffected by this and are
+| reported as-is.
+|
+*/
 
-class PicanolMachineReader {
+class ItemaMachineReader {
     constructor(machine) {
         this.machine = machine;
         this.machineId = String(machine.id);
-        this.baseUrl = this.createBaseUrl(machine);
+        this.ip = machine.ip;
+        this.port = machine.port || undefined;
         this.pollTimer = null;
         this.polling = false;
         this.destroyed = false;
         this.lastPayloadAt = null;
         this.lastError = null;
-    }
-
-    createBaseUrl(machine) {
-        if (machine.hmiUrl) {
-            return String(machine.hmiUrl).replace(/\/+$/, "");
-        }
-
-        if (!machine.ip) {
-            throw new Error(`Machine ${machine.id} has no IP address`);
-        }
-
-        const ip = String(machine.ip);
-
-        if (ip.startsWith("http://") || ip.startsWith("https://")) {
-            return ip.replace(/\/+$/, "");
-        }
-
-        const hasPort = /:\d+$/.test(ip);
-
-        return `http://${ip}${hasPort ? "" : `:${CONFIG.hmiPort}`}`;
     }
 
     start() {
@@ -284,13 +193,6 @@ class PicanolMachineReader {
         this.pollTimer = setInterval(() => this.poll(), CONFIG.dataPushIntervalMs);
     }
 
-    async fetchPath({ path, key }) {
-        const response = await axiosInstance.get(`${this.baseUrl}${path}`);
-        const body = response.data;
-
-        return body && Object.prototype.hasOwnProperty.call(body, key) ? body[key] : body;
-    }
-
     async poll() {
         if (this.destroyed || this.polling) {
             return;
@@ -299,29 +201,16 @@ class PicanolMachineReader {
         this.polling = true;
 
         try {
-            let [production, shift, density, warp, stopActual, machineDetails] = await Promise.all([
-                this.fetchPath(ENDPOINTS.production),
-                this.fetchPath(ENDPOINTS.shift),
-                this.fetchPath(ENDPOINTS.density),
-                this.fetchPath(ENDPOINTS.warp),
-                this.fetchPath(ENDPOINTS.stopActual),
-                this.fetchPath(ENDPOINTS.machineDetails)
-            ]);
-
-            if(density !== null && density !== undefined){
-                density = Math.round(density / 39.3701); // Convert picks per meter to picks per inch
-            }
+            const data = await readItemaMachine(this.ip, this.port);
 
             this.lastPayloadAt = new Date().toISOString();
             this.lastError = null;
 
             if (CONFIG.logVariableChanges) {
-                console.log(`[${this.machineId}] production=${JSON.stringify(production)}`);
-                console.log(`[${this.machineId}] shift=${JSON.stringify(shift)}`);
-                console.log(`[${this.machineId}] stopActual=${JSON.stringify(stopActual)}`);
+                console.log(`[${this.machineId}] itema=${JSON.stringify(data)}`);
             }
 
-            this.processMachineData({ production, shift, density, warp, stopActual, machineDetails });
+            this.processMachineData(data);
         } catch (error) {
             this.lastError = error.message;
 
@@ -338,14 +227,13 @@ class PicanolMachineReader {
         }
     }
 
-    processMachineData({ production, shift, density, warp, stopActual, machineDetails }) {
+    processMachineData(data) {
         const state = machineData[this.machineId] || initMachineData(this.machine);
         const nowUtc = moment().utc().format();
 
-        const running = textOrNull(production && production.currentProductionState) === "RUNNING";
-        const stopInfo = running ? null : classifyPicanolStop(stopActual);
-        const currentStop = stopInfo ? stopInfo.category : null;
-        const currentStopCode = running ? 0 : stopInfo.code;
+        const running = (data.stopCategory ?? 0) === 0;
+        const currentStop = running ? null : "other";
+        const currentStopCode = running ? 0 : data.stopCategory * 1000 + (data.stopDetail || 0);
 
         if (!state.stop && currentStop) {
             state.lastStopTime = nowUtc;
@@ -360,68 +248,38 @@ class PicanolMachineReader {
             state.lastStopTime = nowUtc;
         }
 
-        const currentShiftId = integerOrNull(production && production.currentShiftId);
-        const previousShiftId = state.shift;
-        const shiftChanged = currentShiftId !== null && previousShiftId !== null && currentShiftId !== previousShiftId;
-
-        if (shiftChanged) {
-            console.log(`[${this.machineId}] Shift changed: ${previousShiftId} -> ${currentShiftId}`);
-
-            if (state.stop && currentStop) {
-                completeCurrentStop(this.machineId);
-                state.lastStopTime = nowUtc;
-            }
-
-            state.prevData = clone(state);
-            state.stopCount = 0;
-            state.stopsData = createEmptyStopsData();
-
-            if (!currentStop) {
-                state.lastStartTime = nowUtc;
-            }
-        }
-
         state.stop = currentStop;
         state.stopCode = currentStopCode;
         state.stopReasonText = currentStop;
-        state.shift = currentShiftId;
         state.updatedTime = nowUtc;
         state.lastDataTime = this.lastPayloadAt;
         state.connected = true;
         state.connectionError = null;
-        state.rawData = this.buildRawData({ production, shift, density, warp, currentStop, currentStopCode, machineDetails });
+        state.rawData = this.buildRawData(data, currentStopCode);
     }
 
-    buildRawData({ production, shift, density, warp, currentStop, currentStopCode, machineDetails }) {
-        const efficiency = shift && shift.elapsedTime && shift.timeNormal ? ((shift.timeNormal / shift.elapsedTime) * 100).toFixed(2) : null;
-        const runtimeSeconds = numberOrNull(shift && shift.timeNormal);
-        const remainingWarpSeconds = numberOrNull(warp && warp.remainingWarpTimePrediction);
+    buildRawData(data, currentStopCode) {
+        const runtimeMinutes = numberOrNull(data.runtime);
 
         return [
-            integerOrNull(production && production.currentShiftId),
-            textOrNull(production && production.currentArticleName),
+            data.currentShiftId,
             currentStopCode,
-            runtimeSeconds === null ? null : Number((runtimeSeconds / 60).toFixed(2)),
-            efficiency === null ? null : Number(efficiency),
-            numberOrNull(density),
-            scaledLengthMeters(shift && shift.fabricLength),
-            integerOrNull(shift && shift.pickCounter),
-            numberWithTwoDecimalsOrNull(warp && warp.remainingWarpLength),
-            numberWithTwoDecimalsOrNull(warp && warp.initialWarpLength),
-            remainingWarpSeconds === null
-                ? null
-                : moment().utc().add(remainingWarpSeconds, "seconds").format(),
-            integerOrNull(shift && shift.WarpStopCounter),
-            secondsToMinutes(shift && shift.WarpStopTimer),
-            integerOrNull(shift && shift.FillingStopCounter),
-            secondsToMinutes(shift && shift.FillingStopTimer),
-            integerOrNull(shift && shift.BobbinStopCounter),
-            secondsToMinutes(shift && shift.BobbinStopTimer),
-            integerOrNull(shift && shift.HandStopCounter),
-            secondsToMinutes(shift && shift.HandStopTimer),
-            integerOrNull(shift && shift.OtherStopCounter),
-            secondsToMinutes(shift && shift.OtherStopTimer),
-            integerOrNull(machineDetails && machineDetails.machineSpeed),
+            runtimeMinutes === null ? null : Number((runtimeMinutes / 60).toFixed(2)),
+            numberOrNull(data.efficiency),
+            numberOrNull(data.weftDensity),
+            numberWithTwoDecimalsOrNull(data.productionMtr),
+            integerOrNull(data.picksCurrentShift),
+            integerOrNull(data.warp && data.warp.count),
+            secondsToMinutes(data.warp && data.warp.duration),
+            integerOrNull(data.weft && data.weft.count),
+            secondsToMinutes(data.weft && data.weft.duration),
+            integerOrNull(data.feeder && data.feeder.count),
+            secondsToMinutes(data.feeder && data.feeder.duration),
+            integerOrNull(data.manual && data.manual.count),
+            secondsToMinutes(data.manual && data.manual.duration),
+            integerOrNull(data.other && data.other.count),
+            secondsToMinutes(data.other && data.other.duration),
+            integerOrNull(data.speed),
         ];
     }
 
@@ -430,8 +288,8 @@ class PicanolMachineReader {
 
         return {
             machineId: this.machineId,
-            ip: this.machine.ip,
-            baseUrl: this.baseUrl,
+            ip: this.ip,
+            port: this.port || null,
             connected: Boolean(state && state.connected),
             lastPayloadAt: this.lastPayloadAt,
             lastError: this.lastError,
@@ -441,22 +299,8 @@ class PicanolMachineReader {
 
     updateMachine(machine) {
         this.machine = machine;
-
-        const newBaseUrl = this.createBaseUrl(machine);
-
-        /*
-         * Reconnect only when the HMI address changed.
-         */
-        if (newBaseUrl !== this.baseUrl) {
-            console.log(`[${this.machineId}] HMI address changed from ${this.baseUrl} to ${newBaseUrl}`);
-
-            this.stop();
-
-            this.destroyed = false;
-            this.baseUrl = newBaseUrl;
-
-            this.start();
-        }
+        this.ip = machine.ip;
+        this.port = machine.port || undefined;
     }
 
     stop() {
@@ -482,10 +326,10 @@ class PicanolMachineReader {
 |--------------------------------------------------------------------------
 */
 
-function isPicanolMachine(machine) {
+function isItemaMachine(machine) {
     const displayType = String(machine.displayType || "").toLowerCase();
 
-    return displayType === "picanolrapier";
+    return displayType === "itema";
 }
 
 /*
@@ -530,16 +374,16 @@ async function syncMachines() {
         }
     }
 
-    const picanolMachines = machines.filter(isPicanolMachine);
+    const itemaMachines = machines.filter(isItemaMachine);
 
     const activeMachineIds = new Set(
-        picanolMachines.map((machine) => String(machine.id)),
+        itemaMachines.map((machine) => String(machine.id)),
     );
 
     /*
      * Add or update readers.
      */
-    for (const machine of picanolMachines) {
+    for (const machine of itemaMachines) {
         const machineId = String(machine.id);
         initMachineData(machine);
         const existingReader = readers.get(machineId);
@@ -549,7 +393,7 @@ async function syncMachines() {
             continue;
         }
         try {
-            const reader = new PicanolMachineReader(machine);
+            const reader = new ItemaMachineReader(machine);
             readers.set(machineId, reader);
             reader.start();
         } catch (error) {
@@ -572,7 +416,7 @@ async function syncMachines() {
         }
     }
 
-    console.log(`Picanol machines active: ${readers.size}`);
+    console.log(`Itema machines active: ${readers.size}`);
 }
 
 /*
@@ -763,9 +607,9 @@ process.on("unhandledRejection", (reason) => {
 validateConfig();
 
 app.listen(CONFIG.port, async () => {
-    console.log(`Picanol gateway running on http://localhost:${CONFIG.port}`);
+    console.log(`Itema gateway running on http://localhost:${CONFIG.port}`);
     console.log(`API: ${CONFIG.apiBaseUrl}`);
-    console.log("Mode: HTTP polling, read-only");
+    console.log("Mode: TCP polling, read-only");
 
     await initAllMachines();
 
