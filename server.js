@@ -94,8 +94,22 @@ function initMachineData(machineId, displayType) {
     };
 }
 
+function ensureStopsDataShape(entry) {
+    const defaults = { warp: [], weft: [], feeder: [], manual: [], other: [], h1: [], h2: [] };
+    if (!entry.stopsData || typeof entry.stopsData !== "object") {
+        entry.stopsData = {};
+    }
+    for (const key of Object.keys(defaults)) {
+        if (!Array.isArray(entry.stopsData[key])) {
+            entry.stopsData[key] = [];
+        }
+    }
+}
+
 function setStopData(machineId, displayType) {
     let stopDuration = 0;
+
+    ensureStopsDataShape(machineData[machineId]);
 
     if (machineData[machineId].lastStopTime) {
         const stopTime = moment(machineData[machineId].lastStopTime);
@@ -466,6 +480,9 @@ async function initAllMachines() {
 
             // preload machineData if backend sends something
             machineData = initData.data.machineData || {};
+            for (const machineId in machineData) {
+                ensureStopsDataShape(machineData[machineId]);
+            }
 
             for (let machine of initData.data.machines) {
                 // fire and forget, each has its own loop and connection
