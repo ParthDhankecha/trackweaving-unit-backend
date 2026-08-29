@@ -11,7 +11,7 @@ app.use(express.json());
 
 const CONFIG = {
     apiBaseUrl: process.env.API_BASE_URL || "https://trackweaving.com/api/v1",
-    workspaceId: process.env.WORKSPACE_ID || "6a83fcdd606858cf59de3918",
+    workspaceId: process.env.WORKSPACE_ID || "6a900dd650559fa74a9eeea5",
     apiKey: process.env.API_KEY || "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21",
     port: parseInt(process.env.PORT || "3001", 10),
     /*
@@ -182,35 +182,42 @@ class ItemaMachineReader {
     }
 
     start() {
-        if (this.destroyed) {
-            return;
-        }
+        if (this.destroyed) return;
 
         initMachineData(this.machine);
 
-        this.poll();
+        const startupDelay = Math.floor(
+            Math.random() * CONFIG.dataPushIntervalMs
+        );
 
-        this.pollTimer = setInterval(() => this.poll(), CONFIG.dataPushIntervalMs);
+        this.pollTimer = setTimeout(
+            () => this.poll(),
+            startupDelay
+        );
     }
 
     async poll() {
-        if (this.destroyed || this.polling) {
-            return;
-        }
+        if (this.destroyed || this.polling) return;
 
         this.polling = true;
 
         try {
-            const data = await readItemaMachine(this.ip, this.port);
+            const data = await readItemaMachine(
+                this.ip,
+                this.port
+            );
 
             this.lastPayloadAt = new Date().toISOString();
             this.lastError = null;
 
             if (CONFIG.logVariableChanges) {
-                console.log(`[${this.machineId}] itema=${JSON.stringify(data)}`);
+                console.log(
+                    `[${this.machineId}] itema=${JSON.stringify(data)}`
+                );
             }
 
             this.processMachineData(data);
+
         } catch (error) {
             this.lastError = error.message;
 
@@ -221,9 +228,20 @@ class ItemaMachineReader {
                 state.connectionError = error.message;
             }
 
-            console.error(`[${this.machineId}] Poll error:`, error.message);
+            console.error(
+                `[${this.machineId}] Poll error:`,
+                error.message
+            );
+
         } finally {
             this.polling = false;
+
+            if (!this.destroyed) {
+                this.pollTimer = setTimeout(
+                    () => this.poll(),
+                    CONFIG.dataPushIntervalMs
+                );
+            }
         }
     }
 
@@ -259,12 +277,12 @@ class ItemaMachineReader {
     }
 
     buildRawData(data, currentStopCode) {
-        const runtimeMinutes = numberOrNull(data.runtime);
+        const runtimeSeconds = numberOrNull(data.runtime);
 
         return [
             data.currentShiftId,
             currentStopCode,
-            runtimeMinutes === null ? null : Number((runtimeMinutes / 60).toFixed(2)),
+            runtimeSeconds === null ? null : Number((runtimeSeconds / 60).toFixed(2)),
             numberOrNull(data.efficiency),
             numberOrNull(data.weftDensity),
             numberWithTwoDecimalsOrNull(data.productionMtr),

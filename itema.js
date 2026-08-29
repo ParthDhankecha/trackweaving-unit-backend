@@ -129,7 +129,7 @@ function parsePrincipal(buf) {
 
     return {
         speed: readU16(buf, 45),
-        weftDensity: Number(((densityRaw / 10) * 2.54).toFixed(2))
+        weftDensity: Math.ceil(Number((densityRaw / 10) * 2.54))
     };
 }
 
@@ -204,28 +204,27 @@ function parseShift(buf) {
 
 
     // Production
-    const totalShiftTime = readU32(buf, 454);
+    const totalShiftTimeSeconds = readU32(buf, 454);
     const productionMtr = readU32(buf, 458) / 100;
 
-    const downtime =
+    const downtimeSeconds =
         warpDuration +
         weftDuration +
         feederDuration +
         manualDuration +
         otherDuration;
 
-    const runtime = Math.max(0, totalShiftTime - downtime);
 
-    const efficiency = totalShiftTime > 0
-        ? (runtime / totalShiftTime) * 100
-        : 0;
+    const runtimeSeconds = Math.max(0, totalShiftTimeSeconds - downtimeSeconds);
+
+    const efficiency = totalShiftTimeSeconds > 0 ? (runtimeSeconds / totalShiftTimeSeconds) * 100 : 0;
 
     return {
         currentShiftId,
         efficiency: Number(efficiency.toFixed(2)),
         picksCurrentShift,
         productionMtr: Number(productionMtr.toFixed(2)),
-        runtime,
+        runtime: totalShiftTimeSeconds,
 
         warp: {
             count: warpCount,
@@ -259,9 +258,19 @@ function parseShift(buf) {
 /* Read Machine                                                               */
 /* -------------------------------------------------------------------------- */
 
+const REQUEST_DELAY = 150;
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
 async function readItemaMachine(ip, port = DEFAULT_PORT) {
     const liveBuf = await request(ip, port, 5);
+
+    await sleep(REQUEST_DELAY);
+
     const principalBuf = await request(ip, port, 18);
+
+    await sleep(REQUEST_DELAY);
+
     const shiftBuf = await request(ip, port, 200);
 
     const live = parseLive(liveBuf);
