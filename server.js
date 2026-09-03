@@ -1,580 +1,851 @@
-// server.js / index.js
+// Tsudakoma air-jet loom reader for TrackWeaving
+// Node.js 12 and Windows 7 compatible build source.
+//
+// Build Windows 7 executable:
+//   pkg tsudakoma-reader-win7.js --targets node12-win-x64 --output trackweaving.exe
+
+"use strict";
+
 const express = require("express");
 const axios = require("axios");
-const ModbusRTU = require("modbus-serial");
-const moment = require("moment");
 const https = require("https");
-const axiosInstance = axios.create({
-    timeout: 15000,
-    httpsAgent: new https.Agent({
-        keepAlive: false,
-    }),
-});
+const { Writable } = require("stream");
+const ftp = require("basic-ftp");
+const moment = require("moment");
 
 const app = express();
 
 // ====== CONFIG ======
-const LOOM_PORT = parseInt(process.env.LOOM_PORT || "502", 10);
-const START_ADDR = parseInt(process.env.START_ADDR || "5000", 10);
-const COUNT = parseInt(process.env.COUNT || "54", 10);
-const ZERO_BASED = true;
-const READ_TIMEOUT_MS = parseInt(process.env.READ_TIMEOUT_MS || "7000", 10);
-const MAX_REGS_PER_READ = parseInt(process.env.MAX_REGS_PER_READ || "60", 10);
+const API_BASE_URL = process.env.TRACKWEAVING_API_URL || "https://trackweaving.com/api/v1";
+const WORKSPACE_ID = process.env.WORKSPACE_ID || "6a993394e0b2517b5fa0e3d2";
+const API_KEY = process.env.TRACKWEAVING_API_KEY || "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21";
 
-const workspaceId = "6a68446f00c76a09812448c3";
+const FTP_PORT = toInteger(process.env.FTP_PORT, 21);
+const FTP_USERNAME = process.env.FTP_USERNAME || "anonymous";
+const FTP_PASSWORD = process.env.FTP_PASSWORD || "aaatccs@";
+const FTP_SECURE = /^true$/i.test(process.env.FTP_SECURE || "false");
+const FTP_TIMEOUT_MS = toInteger(process.env.FTP_TIMEOUT_MS, 30000);
 
-const REGISTER = {
-    nazon: {
-        stop: 5027,
-        shift: 5012,
-        setPicks: 5035,
-        clothLength: 5018,
-        loomState: 5028,
-        speed: 5010,
-        efficiency: 5017
-    },
-    chitic: {
-        stop: 5023,
-        shift: 5005,
-        setPicks: 5002,
-        clothLength: 5006,
-        loomState: 5013,
-        speed: 5003,
-        efficiency: 5044
-    },
-    pickwell: {
-        stop: 5023,
-        shift: 5005,
-        setPicks: 5002,
-        clothLength: 5006,
-        loomState: 5013,
-        speed: 5003,
-        efficiency: 5044
-    },
-    biana: {
-        stop: 6,
-        shift: 1,
-        speed: 2,
-        nightSpeed: 72
-    }
-};
+const POLL_INTERVAL_MS = toInteger(process.env.POLL_INTERVAL_MS, 10000);
+const EVENT_POLL_INTERVAL_MS = toInteger(process.env.EVENT_POLL_INTERVAL_MS, 300000);
+const MACHINE_REFRESH_MS = toInteger(process.env.MACHINE_REFRESH_MS, 300000);
+const DATA_PUSH_INTERVAL_MS = toInteger(process.env.DATA_PUSH_INTERVAL_MS, 5000);
+const POWER_OFF_AFTER_MS = toInteger(process.env.POWER_OFF_AFTER_MS, 90000);
+const MAX_CONCURRENT_FTP = toInteger(process.env.MAX_CONCURRENT_FTP, 3);
+const MIN_COUNTED_STOP_SECONDS = toInteger(process.env.MIN_COUNTED_STOP_SECONDS, 0);
+const LOOM_UTC_OFFSET = process.env.LOOM_UTC_OFFSET || "+05:30";
+const HTTP_PORT = toInteger(process.env.PORT, 3001);
 
-const UNIT_IDS = {
-    'nazon': 85,
-    'chitic': 1,
-    'pickwell': 1,
-    'biana': 255
-}
+const POWER_OFF_STOP_CODE = 9999;
+const UNKNOWN_STOP_CODE = 9998;
+
+const RAW_INDEX = Object.freeze({ shift: 0, quality: 1, stopCode: 2, runTime: 3, efficiencyPercent: 4, currentDensity: 5, pieceLengthM: 6, picksCurrentShift: 7, beamLeft: 8, initialBeamLeft: 9, beamCompletionDate: 10, warpStopCount: 11, warpStopDuration: 12, h1StopCount: 13, h1StopDuration: 14, h2StopCount: 15, h2StopDuration: 16, otherStopCount: 17, otherStopDuration: 18, speedRpm: 19 });
+
+const axiosInstance = axios.create({ timeout: 15000, httpsAgent: new https.Agent({ keepAlive: false }) });
 
 let machineData = {};
-let isDataStorAPICalled = false;
+const pollers = new Map();
+let shuttingDown = false;
 
-// Track all active clients for graceful shutdown
-const allClients = new Set();
+// ====== GENERAL HELPERS ======
+function toInteger(value, fallback) {
+    const parsed = Number.parseInt(value, 10);
+    return Number.isFinite(parsed) ? parsed : fallback || 0;
+}
 
-// ====== HELPERS ======
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function toNumber(value, fallback) {
+    const parsed = Number.parseFloat(String(value === undefined || value === null ? "" : value).trim());
+    return Number.isFinite(parsed) ? parsed : fallback || 0;
+}
 
-function initMachineData(machineId, displayType) {
-    machineData[machineId] = {
-        displayType,
-        stopCount: 0,
-        stopsData: {
-            warp: [],
-            weft: [],
-            feeder: [],
-            manual: [],
-            other: [],
-            h1: [],
-            h2: []
-        },
-        lastStopTime: null,
-        lastStartTime: null,
-        stop: 0
+function toSystemShift(rawShift) {
+    // Machine reports day shift = 1, night shift = 2; our system uses day = 0, night = 1.
+    const shift = toInteger(rawShift);
+    return shift > 0 ? shift - 1 : shift;
+}
+
+function round(value, decimals) {
+    if (!Number.isFinite(value)) return 0;
+    const decimalPlaces = decimals === undefined ? 1 : decimals;
+    const factor = 10 ** decimalPlaces;
+    return Math.round(value * factor) / factor;
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function utcNow() {
+    return moment.utc().format();
+}
+
+function loomDateTimeToUtc(date, time) {
+    const normalizedDate = String(date || "").trim().replace(/\//g, "-");
+    const timeParts = String(time || "").trim().split(":");
+    const normalizedTime = timeParts.length === 3 ? `${timeParts[0].padStart(2, "0")}:${timeParts[1].padStart(2, "0")}:${timeParts[2].padStart(2, "0")}` : String(time || "").trim();
+    const parsed = moment.parseZone(`${normalizedDate}T${normalizedTime}${LOOM_UTC_OFFSET}`, "YYYY-MM-DDTHH:mm:ssZ", true);
+    return parsed.isValid() ? parsed.utc().format() : null;
+}
+
+function blankStopsData() {
+    return {
+        warp: [],
+        weft: [],
+        feeder: [],
+        manual: [],
+        other: [],
+        h1: [],
+        h2: []
     };
 }
 
-function setStopData(machineId, displayType) {
-    let stopDuration = 0;
-
-    if (machineData[machineId].lastStopTime) {
-        const stopTime = moment(machineData[machineId].lastStopTime);
-        stopDuration = Math.abs(moment().diff(stopTime, "seconds"));
-        if (stopDuration >= 60) {
-            machineData[machineId].stopCount += 1;
-        }
-    }
-
-    const stopCode = machineData[machineId].stop;
-    const baseEntry = {
-        start: machineData[machineId].lastStopTime,
-        end: moment().utc().format(),
-        statusCode: stopCode,
-        duration: stopDuration
-    };
-
-    // Logic split by displayType
-    if (displayType === "nazon") {
-        switch (stopCode) {
-            case 1:
-            case 19:
-            case 20:
-                machineData[machineId].stopsData.warp.push(baseEntry);
-                break;
-            case 2:
-            case 3:
-            case 11:
-            case 12:
-            case 15:
-            case 16:
-            case 17:
-            case 18:
-                machineData[machineId].stopsData.weft.push(baseEntry);
-                break;
-            case 7:
-                machineData[machineId].stopsData.feeder.push(baseEntry);
-                break;
-            case 4:
-            case 6:
-                machineData[machineId].stopsData.manual.push(baseEntry);
-                break;
-            default:
-                machineData[machineId].stopsData.other.push(baseEntry);
-                break;
-        }
-    } else if (["chitic", "pickwell"].includes(displayType)) {
-        switch (stopCode) {
-            case 1:
-                machineData[machineId].stopsData.warp.push(baseEntry);
-                break;
-            case 2:
-            case 3:
-            case 11:
-            case 12:
-                machineData[machineId].stopsData.weft.push(baseEntry);
-                break;
-            case 7:
-                machineData[machineId].stopsData.feeder.push(baseEntry);
-                break;
-            case 4:
-            case 6:
-                machineData[machineId].stopsData.manual.push(baseEntry);
-                break;
-            default:
-                machineData[machineId].stopsData.other.push(baseEntry);
-                break;
-        }
-    } else if(displayType === "biana") {
-        switch (stopCode) {
-            case 1:
-                machineData[machineId].stopsData.manual.push(baseEntry);
-                break;
-
-            case 2:
-                machineData[machineId].stopsData.warp.push(baseEntry);
-                break;
-            
-            case 3:
-            case 4:
-            case 5:
-            case 6:
-            case 7:
-            case 8:
-            case 9:
-                machineData[machineId].stopsData.h1.push(baseEntry);
-                break;
-                
-            default:
-                machineData[machineId].stopsData.other.push(baseEntry);
-                break;
-
-        }
-    }
-}
-
-function processData(machine, data) {
-    const machineId = machine.id;
-    const displayType = machine.displayType || "nazon";
-    const reg = REGISTER[displayType];
-
-    if (!reg) {
-        console.warn(`Unknown displayType "${displayType}" for machine ${machineId}`);
-        return;
-    }
-
-    const startAddr = ZERO_BASED ? START_ADDR - 1 : START_ADDR;
-    const at = (addr) => data[addr - startAddr];
-
-    let speed = at(reg.speed);
-    let stop = at(reg.stop);
-    let shift = at(reg.shift);
-    if(at(reg.nightSpeed) > 10){
-        shift = 1;
-    }
-
-    // if (speed > 20) {
-    //     data[reg.stop - startAddr] = 0;
-    //     stop = 0;
-    // }
+function ensureMachineData(machine) {
+    const machineId = String(machine.id);
 
     if (!machineData[machineId]) {
-        initMachineData(machineId, displayType);
-    }
-    machineData[machineId].updatedTime = moment().utc().format();
-
-    // Handle transitions between running and stopped
-    if (machineData[machineId].stop === 0 && stop !== 0) {
-        // just stopped
-        machineData[machineId].lastStopTime = moment().utc().format();
-    } else if (machineData[machineId].stop !== 0 && stop === 0) {
-        // just started
-        machineData[machineId].lastStartTime = moment().utc().format();
-        setStopData(machineId, displayType);
-    } else if (
-        typeof machineData[machineId].shift === "number" &&
-        shift !== machineData[machineId].shift
-    ) {
-        // shift change
-        if (machineData[machineId].stop !== 0 && stop !== 0) {
-            setStopData(machineId, displayType);
-            machineData[machineId].lastStopTime = moment().utc().format();
-        }
-
-        machineData[machineId].prevData = JSON.parse(JSON.stringify(machineData[machineId]));
-        machineData[machineId].stopCount = 0;
-        machineData[machineId].stopsData = {
-            warp: [],
-            weft: [],
-            feeder: [],
-            manual: [],
-            other: [],
-            h1: [],
-            h2: []
-        };
-
-        if (machineData[machineId].stop === 0 && stop === 0) {
-            machineData[machineId].lastStartTime = moment().utc().format();
-        }
+        machineData[machineId] = { displayType: machine.displayType || "tsudakoma", stopCount: 0, totalStopCount: 0, stopsData: blankStopsData(), lastStopTime: null, lastStartTime: null, stop: 0, shift: null, isPowerOff: false };
     }
 
-    machineData[machineId].stop = stop;
+    const data = machineData[machineId];
+    data.displayType = machine.displayType || "tsudakoma";
+    data.stopsData = { ...blankStopsData(), ...(data.stopsData || {}) };
 
-    // Adjust setPicks and efficiency for some device types
-    if (machine.deviceType === "rs485" || ["chitic", "pickwell"].includes(displayType)) {
-        data[reg.setPicks - startAddr] = at(reg.setPicks) / 10;
-    }
-    if (["chitic", "pickwell"].includes(displayType)) {
-        data[reg.efficiency - startAddr] = at(reg.efficiency)/10;
-    }
-
-    if(displayType === "biana" && shift == 1) {
-        data[0] = 1;
-    }
-
-    machineData[machineId].rawData = data;
-    machineData[machineId].shift = shift;
+    return data;
 }
 
-function withTimeout(promise, ms, label) {
-    return Promise.race([
-        promise,
-        new Promise((_, reject) =>
-            setTimeout(() => reject(new Error(`${label} timeout`)), ms)
-        )
-    ]);
+function isTsudakomaMachine(machine) {
+    const type = String(machine.displayType || "").toLowerCase();
+
+    if (!type) return true;
+
+    return ["tsudakoma", "tsudokuma", "tsudakoma-airjet", "tsudakoma_airjet"].includes(type);
 }
 
-// Read `count` registers starting at `start` in chunks sized by `MAX_REGS_PER_READ`.
-// Returns an object with a `data` array compatible with `modbus-serial` responses.
-async function readRegistersInChunks(client, start, count, ip) {
-    const chunks = [];
-    let remaining = count;
-    let offset = start;
+function resolveLoomNumber(machine) {
+    const explicitLoomNo = machine.tsudakomaLoomNo || machine.ftpLoomNo;
 
-    while (remaining > 0) {
-        const len = Math.min(remaining, MAX_REGS_PER_READ);
-        const part = await withTimeout(
-            client.readHoldingRegisters(offset, len),
-            READ_TIMEOUT_MS,
-            `Read timeout ${ip}`
-        );
-        const dataPart = part.data || [];
-        chunks.push(...dataPart);
-        offset += len;
-        remaining -= len;
-        // small pause between chunked requests to avoid overwhelming the device
-        await sleep(50);
+    if (explicitLoomNo) {
+        const number = Number.parseInt(explicitLoomNo, 10);
+        if (number > 0) return number;
     }
 
-    return { data: chunks };
+    const octets = String(machine.ip || "").split(".").map(Number);
+
+    if (octets.length === 4 && octets.every(Number.isFinite)) {
+        const loomNo = ((octets[2] - 1) * 256) + octets[3] + 1;
+        if (loomNo > 0) return loomNo;
+    }
+
+    throw new Error(`Cannot resolve Tsudakoma loom number for machine ${machine.id}`);
 }
 
-// ====== POLLING LOOP (per machine) ======
-async function pollLoop(machine) {
-    const client = new ModbusRTU();
-    allClients.add(client);
+function parseCsvLine(line) {
+    const fields = [];
+    let value = "";
+    let quoted = false;
 
-    const displayType = machine.displayType || "nazon";
-    let unitId = UNIT_IDS[displayType] || 1;
+    for (let index = 0; index < line.length; index += 1) {
+        const char = line[index];
 
-    let backoffMs = 5000;
-    let lastError = null;
-    let connecting = false;
-    let consecutiveTimeouts = 0;
-
-    const ip = machine.ip;
-
-    // Event handlers to avoid unhandled errors
-    client.on("error", (e) => {
-        lastError = e?.message || String(e);
-        console.log(`Client error on ${ip}:`, lastError);
-        try {
-            if (client.isOpen) client.close(true);
-        } catch (_) {}
-    });
-
-    client.on("close", () => {
-        console.log(`Connection closed for ${ip}`);
-    });
-
-    async function connect() {
-        if (client.isOpen || connecting) return;
-        connecting = true;
-        try {
-            console.log(`Connecting to ${ip}:${LOOM_PORT} (UNIT_ID=${unitId})...`);
-            await client.connectTCP(ip, { port: LOOM_PORT });
-            client.setID(unitId);
-            // IMPORTANT: do NOT set client.setTimeout here; the library
-            // sometimes throws uncaught on its own TCP timeout.
-            console.log(`Connected to ${ip}:${LOOM_PORT} (UNIT_ID=${unitId})`);
-            lastError = null;
-            connecting = false;
-        } catch (e) {
-            connecting = false;
-            lastError = e?.message || String(e);
-            console.log(`Connect error for ${ip}:`, lastError);
-            try {
-                if (client.isOpen) client.close(true);
-            } catch (_) {}
-        } finally {
-            connecting = false;
+        if (char === '"') {
+            if (quoted && line[index + 1] === '"') {
+                value += '"';
+                index += 1;
+            } else {
+                quoted = !quoted;
+            }
+        } else if (char === "," && !quoted) {
+            fields.push(value);
+            value = "";
+        } else {
+            value += char;
         }
     }
 
-    const start = ZERO_BASED ? START_ADDR - 1 : START_ADDR;
+    fields.push(value);
 
-    while (true) {
-        try {
-            if (!client.isOpen && !connecting) {
-                await connect();
-            }
-
-            if (client.isOpen) {
-                let resp;
-                try {
-                    // Use chunked reads when COUNT exceeds MAX_REGS_PER_READ or for biana devices
-                    if (displayType === "biana" || COUNT > MAX_REGS_PER_READ) {
-                        resp = await readRegistersInChunks(client, start, COUNT, ip);
-                    } else {
-                        resp = await withTimeout(
-                            client.readHoldingRegisters(start, COUNT),
-                            READ_TIMEOUT_MS,
-                            `Read timeout ${ip}`
-                        );
-                    }
-                } catch (e) {
-                    lastError = e?.message || String(e);
-                    console.log(`Read error for ${ip}:`, lastError);
-
-                    if (lastError.includes("Read timeout")) {
-                        consecutiveTimeouts += 1;
-                    } else {
-                        consecutiveTimeouts = 0;
-                    }
-
-                    if (lastError.includes("Read timeout") || consecutiveTimeouts > 0) {
-                        try {
-                            if (client.isOpen) client.close(true);
-                        } catch (_) {
-                            try { client.close(); } catch (_) {}
-                        }
-                    } else {
-                        try {
-                            client.close(true);
-                        } catch (_) {
-                            try { client.close(); } catch (_) {}
-                        }
-                    }
-
-                    // increase backoff
-                    backoffMs = Math.min(backoffMs * 2, 10000);
-                    await sleep(backoffMs);
-                    continue;
-                }
-
-                const data = resp.data || [];
-
-                const reg = REGISTER[displayType];
-                if (
-                    displayType !== "biana" &&
-                    data.length > 30 &&
-                    data[reg.clothLength - start] === 0 &&
-                    data[reg.loomState - start] === 0 &&
-                    data[reg.speed - start] === 0
-                ) {
-                    console.log(`Suspicious zero data from ${ip}:`, data);
-                } else {
-                    processData(machine, data);
-                }
-
-                lastError = null;
-                consecutiveTimeouts = 0;
-                backoffMs = 1000; // reset backoff on success
-            }
-        } catch (err) {
-            const msg = err?.message || String(err);
-            console.log(`Unexpected error in pollLoop(${ip}):`, msg);
-            lastError = msg;
-            try {
-                client.close(true);
-            } catch (_) {
-                try { client.close(); } catch (_) {}
-            }
-            backoffMs = Math.min(backoffMs * 2, 10000);
-        }
-
-        await sleep(backoffMs);
-    }
+    return fields;
 }
 
-// ====== INIT ALL MACHINES ======
-async function initAllMachines() {
-    let delayMs = 5000;
+function parseCsvRows(text) {
+    return String(text || "").replace(/^\uFEFF/, "").split(/\r?\n/).filter((line) => line.length > 0).map(parseCsvLine);
+}
 
-    while(true) {
-        try {
-            console.log("Fetching machine list...");
-            let initData = await axiosInstance.post(
-                "https://trackweaving.com/api/v1/machine-logs/machine-list",
-                {
-                    workspaceId: workspaceId,
-                    apiKey:
-                        "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21"
-                }
-            );
-            initData = initData.data;
+// ====== FTP CONCURRENCY ======
+class Semaphore {
+    constructor(limit) {
+        this.limit = Math.max(1, limit);
+        this.active = 0;
+        this.waiters = [];
+    }
 
-            // preload machineData if backend sends something
-            machineData = initData.data.machineData || {};
-
-            for (let machine of initData.data.machines) {
-                // fire and forget, each has its own loop and connection
-                pollLoop(machine).catch((e) => {
-                    console.error(`pollLoop crashed for machine ${machine.id}:`, e);
-                });
-            }
-            console.log(`Initialized ${initData.data.machines.length} machines.`);
+    async acquire() {
+        if (this.active < this.limit) {
+            this.active += 1;
             return;
+        }
+
+        await new Promise((resolve) => this.waiters.push(resolve));
+
+        this.active += 1;
+    }
+
+    release() {
+        this.active = Math.max(0, this.active - 1);
+
+        const next = this.waiters.shift();
+
+        if (next) next();
+    }
+
+    async use(fn) {
+        await this.acquire();
+
+        try {
+            return await fn();
+        } finally {
+            this.release();
+        }
+    }
+}
+
+const ftpSemaphore = new Semaphore(MAX_CONCURRENT_FTP);
+
+class MemoryWritable extends Writable {
+    constructor() {
+        super();
+        this.chunks = [];
+    }
+
+    _write(chunk, encoding, callback) {
+        this.chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding));
+        callback();
+    }
+
+    text() {
+        return Buffer.concat(this.chunks).toString("utf8");
+    }
+}
+
+async function downloadText(client, remotePath) {
+    const target = new MemoryWritable();
+
+    await client.downloadTo(target, remotePath);
+
+    return target.text();
+}
+
+function ftpCredentials(machine) {
+    return {
+        user: machine.ftpUsername || machine.ftpUser || FTP_USERNAME,
+        password: machine.ftpPassword || FTP_PASSWORD
+    };
+}
+
+async function readLoomFiles(machine, includeEvents) {
+    async function readFiles() {
+        const client = new ftp.Client(FTP_TIMEOUT_MS);
+        client.prepareTransfer = ftp.enterPassiveModeIPv4;
+        client.ftp.verbose = /^true$/i.test(process.env.FTP_VERBOSE || "true");
+        const credentials = ftpCredentials(machine);
+        const loomNo = resolveLoomNumber(machine);
+
+        client.ftp.verbose = /^true$/i.test(process.env.FTP_VERBOSE || "false");
+
+        try {
+            await client.access({ host: machine.ip, port: toInteger(machine.ftpPort, FTP_PORT), user: credentials.user, password: credentials.password, secure: FTP_SECURE });
+
+            const files = {};
+
+            files.status = await downloadText(client, "I_STATUS.CSV");
+            files.shiftProduction = await downloadText(client, "I_SHIFTPRD.CSV");
+
+            try {
+                files.tissStatus = await downloadText(client, `${loomNo}_I_TISS_STATUS.CSV`);
+            } catch (error) {
+                files.tissStatusError = error && error.message ? error.message : String(error);
+            }
+            try {
+                files.autoSettings = await downloadText(client, "I_AUTO.CSV");
+                files.autoSettingsError = null;
+            } catch (error) {
+                files.autoSettingsError = error && error.message ? error.message : String(error);
+            }
+            if (includeEvents) {
+                try {
+                    files.shiftEvents = await downloadText(client, "I_SHIFTEVT.CSV");
+                } catch (error) {
+                    files.shiftEventsError = error && error.message ? error.message : String(error);
+                }
+            }
+
+            return { files, loomNo };
+        } finally {
+            client.close();
+        }
+    }
+
+    return ftpSemaphore.use(readFiles);
+}
+
+// ====== CSV PARSERS ======
+function parseStatusCsv(text) {
+    const rows = parseCsvRows(text);
+
+    if (!rows.length || rows[0].length < 33) {
+        throw new Error("I_STATUS.CSV has an invalid or incomplete row");
+    }
+
+    const row = rows[0];
+    const runFlag = toInteger(row[2]);
+    const rawStopCode = toInteger(row[4]);
+    const currentStop = runFlag === 1 ? 0 : rawStopCode || UNKNOWN_STOP_CODE;
+    const beamOriginalMeter = toNumber(row[24]) / 10;
+    const beamConsumedMeter = toNumber(row[26]) / 10;
+    const beamLeftMeter = Math.max(0, beamOriginalMeter - beamConsumedMeter);
+    const beamRemainingHours = Math.max(0, toNumber(row[31]));
+
+    return {
+        sourceDate: String(row[0]).trim(),
+        sourceTime: String(row[1]).trim(),
+        sourceTimestamp: loomDateTimeToUtc(row[0], row[1]),
+        runFlag,
+        currentStop,
+        rawStopCode,
+        status: toInteger(row[3]),
+        doffNo: toInteger(row[18]),
+        clothTargetMeter: toNumber(row[19]) / 10,
+        clothRuntimeRaw: toNumber(row[20]),
+        directClothPicks: toNumber(row[21]),
+        currentPieceMeter: toNumber(row[22]) / 10,
+        beamOriginalMeter: round(beamOriginalMeter, 1),
+        beamConsumedMeter: round(beamConsumedMeter, 1),
+        beamLeftMeter: round(beamLeftMeter, 1),
+        clothRemainingMinutes: toNumber(row[29]) / 10,
+        beamRemainingHours,
+        raw: row
+    };
+}
+
+function parseShiftProductionCsv(text) {
+    const rows = parseCsvRows(text);
+
+    if (!rows.length) throw new Error("I_SHIFTPRD.CSV is empty");
+
+    const row = rows[rows.length - 1];
+
+    if (row.length < 20) throw new Error("I_SHIFTPRD.CSV current row is incomplete");
+
+    const rpm = toNumber(row[6]);
+    const elapsedMinutes = toNumber(row[7]) / 10;
+    const availableMinutes = toNumber(row[8]) / 10;
+    const runtimeMinutes = toNumber(row[8]) / 10;
+    const productionMeter = toNumber(row[10]) / 10;
+    const unavailableMinutes = toNumber(row[11]) / 10;
+    const totalStopCount = toInteger(row[15]);
+
+    const millEfficiency = elapsedMinutes > 0 ? (availableMinutes / elapsedMinutes) * 100 : toNumber(row[19]) / 10;
+    const loomEfficiency = toNumber(row[19]) / 10;
+    const calculatedShiftPicks = Math.max(0, Math.round(toNumber(row[9]) * 100));
+
+    return {
+        shiftDate: String(row[0]).trim(),
+        shift: toSystemShift(row[1]),
+        sourceDate: String(row[3]).trim(),
+        sourceTime: String(row[4]).trim(),
+        sourceTimestamp: loomDateTimeToUtc(row[3], row[4]),
+        styleNo: String(row[5] || "").trim(),
+        rpm,
+        elapsedMinutes: round(elapsedMinutes, 1),
+        availableMinutes: round(availableMinutes, 1),
+        runtimeMinutes: round(runtimeMinutes, 1),
+        productionMeter: round(productionMeter, 1),
+        unavailableMinutes: round(unavailableMinutes, 1),
+        millEfficiency: round(millEfficiency, 1),
+        loomEfficiency: round(loomEfficiency, 1),
+        calculatedShiftPicks,
+        totalStopCount,
+        raw: row
+    };
+}
+
+function parseTissStatusCsv(text) {
+    if (!text) return null;
+
+    const rows = parseCsvRows(text);
+
+    if (!rows.length || rows[0].length < 16) return null;
+
+    const row = rows[0];
+
+    return {
+        sourceDate: String(row[0]).trim(),
+        sourceTime: String(row[1]).trim(),
+        sourceTimestamp: loomDateTimeToUtc(row[0], row[1]),
+        assumedCurrentOrSetRpm: toNumber(row[5]) / 10,
+        assumedWeftDensity: toNumber(row[14]) / 10,
+        raw: row
+    };
+}
+
+function parseAutoSettingsCsv(text) {
+    if (!text) return null;
+
+    const rows = parseCsvRows(text);
+
+    if (rows.length <= 2732) return null;
+
+    const densityRaw = toNumber(rows[2732][0]);
+
+    return {
+        densityRaw,
+        weftDensity: densityRaw / 10
+    };
+}
+
+const STOP_CODE = Object.freeze({ 20: { reason: "H1 feeler C1", bucket: "h1", group: "filling" }, 21: { reason: "H1 feeler C2", bucket: "h1", group: "filling" }, 25: { reason: "H2 feeler C1", bucket: "h2", group: "filling" }, 26: { reason: "H2 feeler C2", bucket: "h2", group: "filling" }, 31: { reason: "Dropper", bucket: "warp", group: "warp" }, 41: { reason: "Leno left", bucket: "other", group: "other" }, 42: { reason: "Leno right", bucket: "other", group: "other" }, 43: { reason: "CC", bucket: "warp", group: "warp" }, 50: { reason: "Package sensor C1", bucket: "h1", group: "h1" }, 51: { reason: "Package sensor C2", bucket: "h1", group: "h1" }, 71: { reason: "Counter", bucket: "other", group: "other" }, 11: { reason: "Stop button", bucket: "manual", group: "other" } });
+
+function stopDefinition(code) {
+    return STOP_CODE[code] || {
+        reason: `Tsudakoma stop ${code}`,
+        bucket: "other",
+        group: "other"
+    };
+}
+
+function parseCurrentShiftEvents(text) {
+    if (!text) return null;
+
+    const rows = parseCsvRows(text);
+
+    if (!rows.length) return null;
+
+    const row = rows[rows.length - 1];
+    const shiftDate = String(row[0]).trim();
+    const shift = toSystemShift(row[1]);
+    const events = [];
+
+    for (let index = 5; index + 10 < row.length; index += 11) {
+        const group = row.slice(index, index + 11);
+        const code = toInteger(group[4]);
+
+        if (code <= 0) continue;
+
+        const start = loomDateTimeToUtc(group[0], group[1]);
+        const durationSeconds = Math.max(0, Math.round(toNumber(group[8]) * 6));
+
+        if (!start || durationSeconds < MIN_COUNTED_STOP_SECONDS) continue;
+
+        const definition = stopDefinition(code);
+
+        events.push({ start, end: moment.utc(start).add(durationSeconds, "seconds").format(), statusCode: code, duration: durationSeconds, reason: definition.reason, group: definition.group, bucket: definition.bucket, doffNo: toInteger(group[2]), clothLengthMeter: toNumber(group[3]) / 10, eventKey: `${start}|${code}|${group[2]}|${group[3]}` });
+    }
+
+    return { shiftDate, shift, events, raw: row };
+}
+
+function buildStopsData(events) {
+    const stopsData = blankStopsData();
+
+    for (const event of events) {
+        const bucket = stopsData[event.bucket] ? event.bucket : "other";
+        const cleanEntry = { start: event.start, end: event.end, statusCode: event.statusCode, duration: event.duration, reason: event.reason, doffNo: event.doffNo, clothLengthMeter: event.clothLengthMeter };
+
+        stopsData[bucket].push(cleanEntry);
+    }
+
+    return stopsData;
+}
+
+function summarizeStops(events) {
+    const summary = { total: { count: 0, durationSeconds: 0 }, filling: { count: 0, durationSeconds: 0 }, warp: { count: 0, durationSeconds: 0 }, other: { count: 0, durationSeconds: 0 }, byCode: {} };
+
+    for (const event of events) {
+        summary.total.count += 1;
+        summary.total.durationSeconds += event.duration;
+
+        const group = summary[event.group] ? event.group : "other";
+
+        summary[group].count += 1;
+        summary[group].durationSeconds += event.duration;
+
+        const key = String(event.statusCode);
+
+        if (!summary.byCode[key]) {
+            summary.byCode[key] = { code: event.statusCode, reason: event.reason, count: 0, durationSeconds: 0 };
+        }
+
+        summary.byCode[key].count += 1;
+        summary.byCode[key].durationSeconds += event.duration;
+    }
+
+    return summary;
+}
+
+// ====== MACHINE PROCESSING ======
+function closeLiveStop(machineState, endTime) {
+    if (!machineState.lastStopTime || !machineState.stop) return;
+
+    const duration = Math.max(0, moment.utc(endTime).diff(moment.utc(machineState.lastStopTime), "seconds"));
+
+    if (duration < MIN_COUNTED_STOP_SECONDS) return;
+
+    const definition = machineState.stop === POWER_OFF_STOP_CODE ? { reason: "Power Off", bucket: "other", group: "other" } : stopDefinition(machineState.stop);
+    const entry = { start: machineState.lastStopTime, end: endTime, statusCode: machineState.stop, duration, reason: definition.reason };
+
+    machineState.stopsData[definition.bucket].push(entry);
+    machineState.stopCount += 1;
+}
+
+function applyStopTransition(machineState, newStop, eventTimestamp) {
+    const now = eventTimestamp || utcNow();
+    const previousStop = toInteger(machineState.stop);
+
+    if (previousStop === 0 && newStop !== 0) {
+        machineState.lastStopTime = now;
+    } else if (previousStop !== 0 && newStop === 0) {
+        closeLiveStop(machineState, now);
+        machineState.lastStartTime = now;
+        machineState.lastStopTime = null;
+    } else if (previousStop !== 0 && newStop !== 0 && previousStop !== newStop) {
+        closeLiveStop(machineState, now);
+        machineState.lastStopTime = now;
+    }
+
+    machineState.stop = newStop;
+}
+
+function aggregateStopBucket(stopsData, bucketNames) {
+    const entries = bucketNames.flatMap((name) => stopsData[name] || []);
+    const durationSeconds = entries.reduce((total, entry) => total + (entry.duration || 0), 0);
+
+    return { count: entries.length, durationSeconds };
+}
+
+function buildNormalizedRawData(values, stopsData) {
+    const data = Array(Object.keys(RAW_INDEX).length).fill(0);
+    const warp = aggregateStopBucket(stopsData, ["warp"]);
+    const h1 = aggregateStopBucket(stopsData, ["h1"]);
+    const h2 = aggregateStopBucket(stopsData, ["h2", "feeder"]);
+    const other = aggregateStopBucket(stopsData, ["other", "manual"]);
+
+    data[RAW_INDEX.shift] = values.shift;
+    data[RAW_INDEX.quality] = values.quality;
+    data[RAW_INDEX.stopCode] = values.currentStop;
+    data[RAW_INDEX.runTime] = values.runtimeMinutes;
+    data[RAW_INDEX.efficiencyPercent] = values.loomEfficiency;
+    data[RAW_INDEX.currentDensity] = values.weftDensity;
+    data[RAW_INDEX.pieceLengthM] = values.productionMeter;
+    data[RAW_INDEX.picksCurrentShift] = values.currentShiftPicks;
+    data[RAW_INDEX.beamLeft] = values.beamLeftMeter;
+    data[RAW_INDEX.initialBeamLeft] = values.beamOriginalMeter;
+    data[RAW_INDEX.beamCompletionDate] = values.beamCompletionDatetime;
+    data[RAW_INDEX.warpStopCount] = warp.count;
+    data[RAW_INDEX.warpStopDuration] = warp.durationSeconds / 60;
+    data[RAW_INDEX.h1StopCount] = h1.count;
+    data[RAW_INDEX.h1StopDuration] = h1.durationSeconds / 60;
+    data[RAW_INDEX.h2StopCount] = h2.count;
+    data[RAW_INDEX.h2StopDuration] = h2.durationSeconds / 60;
+    data[RAW_INDEX.otherStopCount] = other.count;
+    data[RAW_INDEX.otherStopDuration] = other.durationSeconds / 60;
+    data[RAW_INDEX.speedRpm] = values.currentRpm;
+
+    return data;
+}
+
+function processLoomData(machine, result, fetchedAt) {
+    const machineId = String(machine.id);
+    const state = ensureMachineData(machine);
+    const status = parseStatusCsv(result.files.status);
+    const production = parseShiftProductionCsv(result.files.shiftProduction);
+    const tiss = parseTissStatusCsv(result.files.tissStatus);
+    const autoSettings = parseAutoSettingsCsv(result.files.autoSettings);
+    const events = parseCurrentShiftEvents(result.files.shiftEvents);
+    const previousShift = state.shift;
+
+    if (Number.isFinite(previousShift) && previousShift !== production.shift) {
+        state.prevData = JSON.parse(JSON.stringify(state));
+        state.stopCount = 0;
+        state.totalStopCount = 0;
+        state.stopsData = blankStopsData();
+        state.stopSummary = summarizeStops([]);
+    }
+
+    if (state.isPowerOff && state.stop === POWER_OFF_STOP_CODE) {
+        applyStopTransition(state, status.currentStop, fetchedAt);
+    } else {
+        applyStopTransition(state, status.currentStop, status.sourceTimestamp || fetchedAt);
+    }
+
+    if (events && events.shift === production.shift) {
+        state.stopsData = buildStopsData(events.events);
+        state.stopSummary = summarizeStops(events.events);
+        state.stopCount = events.events.length;
+        state.totalStopCount = production.totalStopCount || events.events.length;
+        state.lastEventSyncAt = fetchedAt;
+
+        if (status.currentStop !== 0) {
+            const latestMatchingEvent = [...events.events].reverse().find((event) => event.statusCode === status.currentStop);
+
+            if (latestMatchingEvent) state.lastStopTime = latestMatchingEvent.start;
+        }
+    } else {
+        state.totalStopCount = production.totalStopCount;
+    }
+
+    const averageRpm = production.rpm;
+    const assumedCurrentRpm = tiss && tiss.assumedCurrentOrSetRpm ? tiss.assumedCurrentOrSetRpm : averageRpm;
+    const currentRpm = status.runFlag === 1 ? assumedCurrentRpm : 0;
+    const tissDensity = tiss && tiss.assumedWeftDensity ? tiss.assumedWeftDensity : 0;
+    const autoDensity = autoSettings && autoSettings.weftDensity ? autoSettings.weftDensity : 0;
+    const configuredDensity = toNumber(machine.setPicks) || toNumber(machine.currentDensity) || toNumber(machine.weftDensity);
+    const weftDensity = tissDensity || autoDensity || configuredDensity;
+    const currentShiftPicks = status.directClothPicks > 0 ? Math.round(status.directClothPicks) : production.calculatedShiftPicks;
+    const beamCompletionDatetime = status.beamRemainingHours > 0 ? moment.utc(fetchedAt).add(status.beamRemainingHours, "hours").format() : null;
+
+    const normalized = { loomNo: result.loomNo, shift: production.shift, quality: production.styleNo, currentStop: status.currentStop, currentStopReason: status.currentStop ? stopDefinition(status.currentStop).reason : null, runFlag: status.runFlag, runtimeMinutes: production.runtimeMinutes, millEfficiency: production.millEfficiency, loomEfficiency: production.loomEfficiency, efficiency: production.loomEfficiency, averageRpm, currentRpm, productionMeter: production.productionMeter, currentPieceMeter: status.currentPieceMeter, currentShiftPicks, beamOriginalMeter: status.beamOriginalMeter, beamConsumedMeter: status.beamConsumedMeter, beamLeftMeter: status.beamLeftMeter, beamRemainingHours: status.beamRemainingHours, beamCompletionDatetime, weftDensity, totalStopCount: production.totalStopCount, doffNo: status.doffNo };
+
+    state.updatedTime = fetchedAt;
+    state.lastSuccessfulReadAt = fetchedAt;
+    state.firstConnectionFailureAt = null;
+    state.isPowerOff = false;
+    state.readError = null;
+    state.shift = production.shift;
+    state.speed = normalized.currentRpm;
+    state.averageRpm = normalized.averageRpm;
+    state.runtime = normalized.runtimeMinutes;
+    state.runtimeMinutes = normalized.runtimeMinutes;
+    state.efficiency = normalized.efficiency;
+    state.millEfficiency = normalized.millEfficiency;
+    state.loomEfficiency = normalized.loomEfficiency;
+    state.productionMeter = normalized.productionMeter;
+    state.currentShiftPicks = normalized.currentShiftPicks;
+    state.beamLeftMeter = normalized.beamLeftMeter;
+    state.beamCompletionDatetime = normalized.beamCompletionDatetime;
+    state.weftDensity = normalized.weftDensity;
+    state.currentPieceMeter = normalized.currentPieceMeter;
+    state.doffNo = normalized.doffNo;
+    state.currentStopReason = normalized.currentStopReason;
+    state.rawData = buildNormalizedRawData(normalized, state.stopsData);
+    state.source = { loomStatusTimestamp: status.sourceTimestamp, shiftProductionTimestamp: production.sourceTimestamp, tissStatusTimestamp: tiss && tiss.sourceTimestamp ? tiss.sourceTimestamp : null, collectedAt: fetchedAt, ftpIp: machine.ip, loomNo: result.loomNo, provisionalFields: { currentRpm: "TISS status field 6 / 10", weftDensity: "TISS status field 16 / 10" } };
+    state.tsudakomaRaw = { status: status.raw, shiftProduction: production.raw, tissStatus: tiss && tiss.raw ? tiss.raw : null };
+
+    return machineData[machineId];
+}
+
+function markMachinePowerOff(machine, error) {
+    const state = ensureMachineData(machine);
+    const now = utcNow();
+    const lastSuccess = state.lastSuccessfulReadAt ? moment.utc(state.lastSuccessfulReadAt) : null;
+
+    if (!state.firstConnectionFailureAt) state.firstConnectionFailureAt = now;
+
+    const offlineFrom = lastSuccess || moment.utc(state.firstConnectionFailureAt);
+    const offlineForMs = moment.utc(now).diff(offlineFrom);
+
+    state.readError = error && error.message ? error.message : String(error);
+    state.lastReadErrorAt = now;
+
+    if (offlineForMs >= POWER_OFF_AFTER_MS && !state.isPowerOff) {
+        applyStopTransition(state, POWER_OFF_STOP_CODE, now);
+
+        state.isPowerOff = true;
+        state.currentStopReason = "Power Off";
+        state.speed = 0;
+
+        if (Array.isArray(state.rawData)) {
+            state.rawData[RAW_INDEX.stopCode] = POWER_OFF_STOP_CODE;
+            state.rawData[RAW_INDEX.speedRpm] = 0;
+        }
+
+        state.updatedTime = now;
+    }
+}
+
+// ====== POLLING ======
+async function pollLoop(machine, control, initialDelayMs) {
+    const machineId = String(machine.id);
+
+    await sleep(initialDelayMs);
+
+    let lastEventPollAt = 0;
+    let backoffMs = POLL_INTERVAL_MS;
+
+    while (!shuttingDown && !control.cancelled) {
+        const startedAt = Date.now();
+
+        try {
+            const includeEvents = !lastEventPollAt || startedAt - lastEventPollAt >= EVENT_POLL_INTERVAL_MS;
+            const result = await readLoomFiles(control.machine, includeEvents);
+            const fetchedAt = utcNow();
+
+            processLoomData(control.machine, result, fetchedAt);
+
+            if (includeEvents && result.files.shiftEvents) lastEventPollAt = startedAt;
+
+            backoffMs = POLL_INTERVAL_MS;
+
+            console.log(`[${fetchedAt}] ${control.machine.ip} L${String(result.loomNo).padStart(3, "0")}`, `stop=${machineData[machineId].stop}`, `rpm=${machineData[machineId].speed}`, `eff=${machineData[machineId].efficiency}`, `meter=${machineData[machineId].productionMeter}`);
         } catch (error) {
-            console.log("Error fetching machine list:", error?.message || error);
-            console.log(`Retrying in ${delayMs / 1000} seconds...`);
-            await sleep(delayMs);
-            delayMs = Math.min(delayMs * 2, 60000); // exponential backoff up to 1 min
+            console.error(`[${utcNow()}] FTP read failed for ${control.machine.ip}:`, error && error.message ? error.message : error);
+
+            markMachinePowerOff(control.machine, error);
+
+            backoffMs = Math.min(Math.max(5000, Math.round(backoffMs * 1.5)), 60000);
         }
+
+        const elapsed = Date.now() - startedAt;
+        const jitter = Math.floor(Math.random() * 2000);
+
+        await sleep(Math.max(1000, backoffMs - elapsed) + jitter);
     }
 }
 
-// ====== PERIODIC DATA PUSH ======
-let dataPushDelay = 5000;
+function startOrUpdatePoller(machine, index) {
+    const id = String(machine.id);
+    const existing = pollers.get(id);
 
-async function dataPushLoop() {
-    try {
-        const dataToSend = {};
-        for (let machineId in machineData) {
-            const m = machineData[machineId];
-            if (
-                m.updatedTime &&
-                moment().diff(moment(m.updatedTime), "hours") < 1
-            ) {
-                dataToSend[machineId] = { ...m };
-            }
-        }
-        await axiosInstance.post("https://trackweaving.com/api/v1/machine-logs", {
-            logs: dataToSend,
-            workspaceId: workspaceId,
-            apiKey:
-                "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21"
-        });
-
-        // clear prevData after sending
-        for (let machineId in machineData) {
-            if (machineData[machineId].prevData) {
-                machineData[machineId].prevData = null;
-            }
-        }
-        dataPushDelay = 5000; // reset delay on success
-    } catch (error) {
-        console.log(new Date(), "Error in data store interval:", error?.message || error);
-        dataPushDelay = Math.min(dataPushDelay * 2, 60000); // exponential backoff up to 1 min
-        if (error.code === "ENOTFOUND" || error.code === "ECONNRESET") {
-            axiosInstance.defaults.httpsAgent.destroy();
-        }
-    }
-
-    setTimeout(dataPushLoop, dataPushDelay);
-}
-
-dataPushLoop();
-
-// ====== EXPRESS SERVER ======
-const PORT = parseInt(process.env.PORT || "3001", 10);
-
-app.get("/health", (req, res) => {
-    res.json({ ok: true, time: new Date(), machines: Object.keys(machineData).length });
-});
-
-app.listen(PORT, () => {
-    console.log(
-        `Loom server on http://localhost:${PORT} started At ${new Date()}`
-    );
-    console.log(
-        `Polling start=${START_ADDR} count=${COUNT} zeroBased=${ZERO_BASED}`
-    );
-    initAllMachines().catch((e) => {
-        console.error("Failed to init machines:", e);
-    });
-});
-
-// ====== GLOBAL ERROR SAFETY NET ======
-
-// Specifically swallow the "TCP Connection Timed Out" crash coming from modbus-serial
-process.on("uncaughtException", (err) => {
-    if (
-        err &&
-        err.message &&
-        (
-            err.message.includes("TCP Connection Timed Out") ||
-            err.message.includes("self.callback is not a function")
-        )
-    ) {
-        console.error("Ignored uncaught TCP timeout error:", err.message);
+    if (existing) {
+        existing.machine = machine;
+        existing.cancelled = false;
         return;
     }
-    console.error("Uncaught exception, exiting:", err);
-    process.exit(1);
-});
 
-process.on("unhandledRejection", (reason) => {
-    console.error("Unhandled promise rejection:", reason);
-});
+    const control = { machine, cancelled: false };
 
-// graceful shutdown
-process.on("SIGINT", async () => {
-    console.log("Gracefully shutting down...");
-    for (const client of allClients) {
+    pollers.set(id, control);
+    ensureMachineData(machine);
+
+    const initialDelayMs = (index % Math.max(1, MAX_CONCURRENT_FTP * 10)) * 1000;
+
+    pollLoop(machine, control, initialDelayMs).catch((error) => handlePollLoopError(error, id));
+}
+
+function handlePollLoopError(error, machineId) {
+    console.error(`pollLoop crashed for machine ${machineId}:`, error);
+    pollers.delete(machineId);
+}
+
+async function fetchMachines() {
+    const response = await axiosInstance.post(`${API_BASE_URL}/machine-logs/machine-list`, { workspaceId: WORKSPACE_ID, apiKey: API_KEY });
+
+    return response.data && response.data.data ? response.data.data : {};
+}
+
+async function machineRefreshLoop() {
+    let retryMs = 5000;
+
+    while (!shuttingDown) {
         try {
-            if (client.isOpen) client.close(true);
-        } catch (_) {}
+            const initData = await fetchMachines();
+            const serverMachineData = initData.machineData || {};
+
+            for (const [machineId, data] of Object.entries(serverMachineData)) {
+                if (!machineData[machineId]) machineData[machineId] = data;
+            }
+
+            const machines = (initData.machines || []).filter(isTsudakomaMachine);
+            const activeIds = new Set(machines.map((machine) => String(machine.id)));
+
+            machines.forEach((machine, index) => startOrUpdatePoller(machine, index));
+
+            for (const [id, control] of pollers.entries()) {
+                if (!activeIds.has(id)) {
+                    control.cancelled = true;
+                    pollers.delete(id);
+                }
+            }
+
+            console.log(`Loaded ${machines.length} Tsudakoma machines from TrackWeaving.`);
+
+            retryMs = MACHINE_REFRESH_MS;
+        } catch (error) {
+            console.error("Error fetching machine list:", error && error.message ? error.message : error);
+
+            retryMs = Math.min(retryMs * 2, 60000);
+        }
+
+        await sleep(retryMs);
     }
-    process.exit(0);
-});
+}
+
+// ====== DATA UPLOAD ======
+async function dataPushLoop() {
+    let delayMs = DATA_PUSH_INTERVAL_MS;
+
+    while (!shuttingDown) {
+        try {
+            const dataToSend = {};
+
+            for (const [machineId, data] of Object.entries(machineData)) {
+                if (data.updatedTime && moment.utc().diff(moment.utc(data.updatedTime), "hours") < 1) {
+                    dataToSend[machineId] = { displayType: data.displayType, lastStopTime: data.lastStopTime, lastStartTime: data.lastStartTime, prevData: data.prevData, stopCount: data.stopCount, stopsData: data.stopsData, stop: data.stop, powerOff: data.isPowerOff, rawData: data.rawData, shift: data.shift };
+                }
+            }
+
+            if (Object.keys(dataToSend).length) {
+                await axiosInstance.post(`${API_BASE_URL}/machine-logs`, { logs: dataToSend, workspaceId: WORKSPACE_ID, apiKey: API_KEY });
+
+                for (const machineId of Object.keys(dataToSend)) {
+                    if (machineData[machineId] && machineData[machineId].prevData) machineData[machineId].prevData = null;
+                }
+            }
+
+            delayMs = DATA_PUSH_INTERVAL_MS;
+        } catch (error) {
+            console.error(`[${utcNow()}] Data upload failed:`, error && error.message ? error.message : error);
+
+            delayMs = Math.min(delayMs * 2, 60000);
+        }
+
+        await sleep(delayMs);
+    }
+}
+
+// ====== HTTP AND PROCESS LIFECYCLE ======
+function healthHandler(req, res) {
+    const machines = Object.entries(machineData).map(([id, data]) => ({ id, updatedTime: data.updatedTime || null, stop: data.stop, isPowerOff: Boolean(data.isPowerOff), readError: data.readError || null }));
+
+    res.json({ ok: true, time: utcNow(), machineCount: machines.length, activePollers: pollers.size, machines });
+}
+
+app.get("/health", healthHandler);
+
+function healthServerStarted() {
+    console.log(`Tsudakoma reader health server: http://localhost:${HTTP_PORT}/health`);
+    console.log(`FTP polling every ${POLL_INTERVAL_MS} ms, events every ${EVENT_POLL_INTERVAL_MS} ms,`, `max FTP sessions ${MAX_CONCURRENT_FTP}`);
+}
+
+async function start() {
+    if (!API_KEY) {
+        console.warn("TRACKWEAVING_API_KEY is empty. Set it before production use.");
+    }
+
+    if (!FTP_PASSWORD) {
+        console.warn("FTP_PASSWORD is empty. Set it before production use.");
+    }
+
+    app.listen(HTTP_PORT, healthServerStarted);
+
+    machineRefreshLoop().catch((error) => console.error("Machine refresh loop failed:", error));
+    dataPushLoop().catch((error) => console.error("Data push loop failed:", error));
+}
+
+function shutdown(signal) {
+    console.log(`${signal} received, shutting down...`);
+
+    shuttingDown = true;
+
+    for (const control of pollers.values()) control.cancelled = true;
+
+    setTimeout(() => process.exit(0), 500).unref();
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
+process.on("uncaughtException", (error) => { console.error("Uncaught exception:", error); process.exit(1); });
+
+if (require.main === module) start().catch((error) => { console.error("Reader startup failed:", error); process.exit(1); });
+
+module.exports = { RAW_INDEX, STOP_CODE, parseStatusCsv, parseShiftProductionCsv, parseTissStatusCsv, parseAutoSettingsCsv, parseCurrentShiftEvents, buildStopsData, summarizeStops, processLoomData, resolveLoomNumber };
