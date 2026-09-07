@@ -111,6 +111,7 @@ function initMachineData(machine) {
         lastDataTime: existing.lastDataTime || null,
         stopCount: existing.stopCount || 0,
         stopsData: existing.stopsData || createEmptyStopsData(),
+        lastShiftId: existing.lastShiftId ?? null,
         lastStopTime: existing.lastStopTime || null,
         lastStartTime: existing.lastStartTime || null,
         stop: existing.stop || null,
@@ -286,6 +287,12 @@ class ItemaMachineReader {
     processMachineData(data) {
         const state = machineData[this.machineId] || initMachineData(this.machine);
         const nowUtc = moment().utc().format();
+
+        const shiftId = data.currentShiftId ?? null;
+        if (state.lastShiftId !== null && shiftId !== null && shiftId !== state.lastShiftId) {
+            state.stopsData = createEmptyStopsData();
+        }
+        state.lastShiftId = shiftId;
 
         const running = (data.stopCategory ?? 0) === 0;
         const currentStop = running ? null : classifyItemaStop(data.stopCategory);
