@@ -136,7 +136,7 @@ function completeCurrentStop(machineId) {
         start: data.lastStopTime,
         end: now.format(),
         category,
-        code: data.stopCode,
+        statusCode: data.stopCode,
         duration,
     };
 
@@ -160,13 +160,51 @@ function completeCurrentStop(machineId) {
 | Itema machine reader (TCP, IDT protocol)
 |--------------------------------------------------------------------------
 |
-| Live stop category/detail codes (IDT 5) aren't mapped to
-| warp/weft/feeder/manual/other yet - every stop is bucketed as
-| "other" until the code table is confirmed. Shift-cumulative
-| per-category counters (IDT 200) are unaffected by this and are
-| reported as-is.
+| Live stop category codes (IDT 5, buf[2]) are mapped to their
+| human-readable reason and their warp/weft/feeder/manual/other
+| bucket below. Shift-cumulative per-category counters (IDT 200)
+| are unaffected by this and are reported as-is.
 |
 */
+
+const STOP_REASON = {
+    0: "--",
+    1: "Warp stop",
+    4: "Production end",
+    5: "Manual stop",
+    6: "Technical stop",
+    7: "Cone end stop",
+    10: "Weft anomaly",
+    11: "No gripping",
+    12: "Left gripper",
+    13: "No exchange",
+    14: "Right gripper",
+    15: "Leno stop",
+    16: "Waste selvedge stop",
+};
+
+/*
+ * Buckets each live stop code into the same warp/weft/feeder/manual/other
+ * categories used by the shift-cumulative counters (IDT 200) in itema.js.
+ * Codes not listed here (e.g. production end, technical stop) fall back
+ * to "other".
+ */
+const STOP_CATEGORY_BY_CODE = {
+    1: "warp",
+    5: "manual",
+    7: "feeder",
+    10: "weft",
+    11: "weft",
+    12: "weft",
+    13: "weft",
+    14: "weft",
+    15: "weft",
+    16: "weft",
+};
+
+function classifyItemaStop(stopCategory) {
+    return STOP_CATEGORY_BY_CODE[stopCategory] || "other";
+}
 
 class ItemaMachineReader {
     constructor(machine) {
@@ -250,7 +288,7 @@ class ItemaMachineReader {
         const nowUtc = moment().utc().format();
 
         const running = (data.stopCategory ?? 0) === 0;
-        const currentStop = running ? null : "other";
+        const currentStop = running ? null : classifyItemaStop(data.stopCategory);
         const currentStopCode = running ? 0 : data.stopCategory * 1000 + (data.stopDetail || 0);
 
         if (!state.stop && currentStop) {
