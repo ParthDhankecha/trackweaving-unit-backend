@@ -383,7 +383,7 @@ function parseTissStatusCsv(text) {
         sourceTime: String(row[1]).trim(),
         sourceTimestamp: loomDateTimeToUtc(row[0], row[1]),
         assumedCurrentOrSetRpm: toNumber(row[5]) / 10,
-        assumedWeftDensity: toNumber(row[14]) / 10,
+        assumedWeftDensity: toNumber(row[15]) / 10,
         raw: row
     };
 }
