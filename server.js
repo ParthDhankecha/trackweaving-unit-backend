@@ -3,6 +3,8 @@
 const express = require("express");
 const axios = require("axios");
 const moment = require("moment");
+const fs = require("fs");
+const path = require("path");
 const https = require("https");
 const { readItemaMachine } = require("./itema");
 
@@ -20,6 +22,7 @@ const CONFIG = {
      */
     dataPushIntervalMs: parseInt(process.env.DATA_PUSH_INTERVAL_MS || "7000", 10),
     logVariableChanges: process.env.LOG_VARIABLE_CHANGES === "true",
+    pendingShiftLogsPath: process.env.PENDING_SHIFT_LOGS_PATH || path.join(process.cwd(), "pending-shift-logs.json"),
 };
     
 const axiosInstance = axios.create({
@@ -42,6 +45,7 @@ const readers = new Map();
 
 let shuttingDown = false;
 let dataPushTimer = null;
+let pendingShiftLogs = [];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -120,6 +124,86 @@ function initMachineData(machine) {
     };
 
     return machineData[machineId];
+}
+
+function loadPendingShiftLogs() {
+    try {
+        if (!fs.existsSync(CONFIG.pendingShiftLogsPath)) {
+            pendingShiftLogs = [];
+            return;
+        }
+
+        const parsed = JSON.parse(fs.readFileSync(CONFIG.pendingShiftLogsPath, "utf8"));
+        if (Array.isArray(parsed)) {
+            pendingShiftLogs = parsed;
+        } else if (parsed && Array.isArray(parsed.logs)) {
+            pendingShiftLogs = parsed.logs;
+        } else {
+            pendingShiftLogs = [];
+        }
+    } catch (error) {
+        console.error("Failed to load pending shift logs:", error.message);
+        pendingShiftLogs = [];
+    }
+}
+
+function persistPendingShiftLogs() {
+    const tmpPath = `${CONFIG.pendingShiftLogsPath}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify({ logs: pendingShiftLogs }, null, 2));
+    fs.renameSync(tmpPath, CONFIG.pendingShiftLogsPath);
+}
+
+function enqueueClosedShiftLog(machineId, state, endedAt) {
+    pendingShiftLogs.push({
+        id: `${machineId}-${Date.now()}-${state.lastShiftId ?? state.shift ?? "x"}`,
+        machineId,
+        updatedTime: endedAt,
+        lastStopTime: state.lastStopTime || null,
+        lastStartTime: state.lastStartTime || null,
+        stop: state.stop,
+        stopsData: JSON.parse(JSON.stringify(state.stopsData || createEmptyStopsData())),
+        rawData: JSON.parse(JSON.stringify(state.rawData || [])),
+        displayType: state.displayType,
+        stopCount: state.stopCount || 0,
+        shift: state.lastShiftId ?? state.shift,
+    });
+
+    try {
+        persistPendingShiftLogs();
+        console.log(
+            `[${machineId}] Stored closed shift locally (${pendingShiftLogs.length} pending)`,
+        );
+    } catch (error) {
+        console.error(`[${machineId}] Failed to store closed shift:`, error.message);
+    }
+}
+
+function removePendingShiftLogs(ids) {
+    const remove = new Set(ids);
+    pendingShiftLogs = pendingShiftLogs.filter((log) => !remove.has(log.id));
+
+    try {
+        persistPendingShiftLogs();
+    } catch (error) {
+        console.error("Failed to update pending shift logs:", error.message);
+    }
+}
+
+async function flushPendingShiftLogs() {
+    if (!pendingShiftLogs.length) {
+        return;
+    }
+
+    const toFlush = pendingShiftLogs.slice();
+
+    await axiosInstance.post(`${CONFIG.apiBaseUrl}/machine-logs/shift`, {
+        logs: toFlush,
+        workspaceId: CONFIG.workspaceId,
+        apiKey: CONFIG.apiKey,
+    });
+
+    removePendingShiftLogs(toFlush.map((log) => log.id));
+    console.log(`Flushed ${toFlush.length} closed shift log(s)`);
 }
 
 function completeCurrentStop(machineId) {
@@ -289,10 +373,7 @@ class ItemaMachineReader {
         const nowUtc = moment().utc().format();
 
         const shiftId = data.currentShiftId ?? null;
-        if (state.lastShiftId !== null && shiftId !== null && shiftId !== state.lastShiftId) {
-            state.stopsData = createEmptyStopsData();
-        }
-        state.lastShiftId = shiftId;
+        const shiftChanged = state.lastShiftId !== null && shiftId !== null && shiftId !== state.lastShiftId;
 
         const running = (data.stopCategory ?? 0) === 0;
         const currentStop = running ? null : classifyItemaStop(data.stopCategory);
@@ -310,6 +391,21 @@ class ItemaMachineReader {
             completeCurrentStop(this.machineId);
             state.lastStopTime = nowUtc;
         }
+
+        if (shiftChanged) {
+            console.log(`[${this.machineId}] Shift changed: ${state.lastShiftId} -> ${shiftId}`);
+            if (state.stop && currentStop) {
+                completeCurrentStop(this.machineId);
+                state.lastStopTime = nowUtc;
+            }
+            enqueueClosedShiftLog(this.machineId, state, nowUtc);
+            state.stopCount = 0;
+            state.stopsData = createEmptyStopsData();
+            if (!currentStop) {
+                state.lastStartTime = nowUtc;
+            }
+        }
+        state.lastShiftId = shiftId;
 
         state.stop = currentStop;
         state.stopCode = currentStopCode;
@@ -571,16 +667,19 @@ async function dataPushLoop() {
             apiKey: CONFIG.apiKey,
         });
 
-        /*
-         * Clear prevData only after a successful upload.
-         */
-        for (const machineId of Object.keys(machineData)) {
-            if (machineData[machineId].prevData) {
-                machineData[machineId].prevData = null;
-            }
-        }
-
         dataPushDelay = CONFIG.dataPushIntervalMs;
+
+        try {
+            await flushPendingShiftLogs();
+        } catch (error) {
+            console.error(
+                new Date(),
+                "Shift log flush error:",
+                error.response && error.response.data
+                    ? error.response.data
+                    : error.message,
+            );
+        }
     } catch (error) {
         console.log(error)
         console.error(
@@ -673,6 +772,11 @@ app.listen(CONFIG.port, async () => {
     console.log(`Itema gateway running on http://localhost:${CONFIG.port}`);
     console.log(`API: ${CONFIG.apiBaseUrl}`);
     console.log("Mode: TCP polling, read-only");
+
+    loadPendingShiftLogs();
+    if (pendingShiftLogs.length) {
+        console.log(`Pending closed shift logs on disk: ${pendingShiftLogs.length}`);
+    }
 
     await initAllMachines();
 
