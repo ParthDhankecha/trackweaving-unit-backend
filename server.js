@@ -3,6 +3,8 @@
 const express = require("express");
 const axios = require("axios");
 const moment = require("moment");
+const fs = require("fs");
+const path = require("path");
 const https = require("https");
 const io = require("socket.io-client");
 
@@ -18,6 +20,7 @@ const CONFIG = {
     fullRefreshIntervalMs: parseInt(process.env.FULL_REFRESH_INTERVAL_MS || "60000",10),
     socketConnectTimeoutMs: parseInt(process.env.SOCKET_CONNECT_TIMEOUT_MS || "10000",10),
     logVariableChanges: process.env.LOG_VARIABLE_CHANGES === "true",
+    pendingShiftLogsPath: process.env.PENDING_SHIFT_LOGS_PATH || path.join(process.cwd(), "pending-shift-logs.json"),
 };
 
 const axiosInstance = axios.create({
@@ -74,6 +77,7 @@ const readers = new Map();
 let shuttingDown = false;
 let dataPushTimer = null;
 let machineSyncTimer = null;
+let pendingShiftLogs = [];
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -134,9 +138,31 @@ function normalizeShift(value) {
 
     return {
         raw: rawValue,
-        number: shiftMap[normalized] || null,
+        number: Object.prototype.hasOwnProperty.call(shiftMap, normalized) ? shiftMap[normalized] : null,
         code: normalized
     };
+}
+
+function isIntegerShift(value) {
+    return Number.isInteger(value);
+}
+
+function resolveStoredShift(existing) {
+    if (isIntegerShift(existing.shift)) {
+        return existing.shift;
+    }
+
+    const rawShift = Array.isArray(existing.rawData) ? existing.rawData[0] : null;
+
+    return isIntegerShift(rawShift) ? rawShift : null;
+}
+
+function hasShiftChanged(previousShift, previousShiftRaw, currentShift, currentShiftRaw) {
+    if (currentShiftRaw != null && previousShiftRaw != null && String(currentShiftRaw) !== String(previousShiftRaw)) {
+        return true;
+    }
+
+    return isIntegerShift(currentShift) && isIntegerShift(previousShift) && currentShift !== previousShift;
 }
 
 /*
@@ -158,6 +184,7 @@ function initMachineData(machine) {
     const machineId = String(machine.id);
 
     const existing = machineData[machineId] || {};
+    const existingShift = resolveStoredShift(existing);
 
     machineData[machineId] = {
         ...existing,
@@ -176,13 +203,103 @@ function initMachineData(machine) {
             ? Number(existing.stop)
             : 0,
         stopReasonText: existing.stopReasonText || null,
-        shift: existing.shift || null,
+        shift: existingShift,
         shiftCode: existing.shiftCode || null,
-        shiftRaw: existing.shiftRaw || null,
+        shiftRaw: existing.shiftRaw != null ? existing.shiftRaw : null,
         rawData: existing.rawData || {},
     };
 
     return machineData[machineId];
+}
+
+/*
+|--------------------------------------------------------------------------
+| Pending closed-shift logs
+|
+| Completed shift snapshots are written to disk immediately so they survive
+| WiFi outages and gateway restarts. They are flushed to the shift-log API
+| only after a successful live data push.
+|--------------------------------------------------------------------------
+*/
+
+function loadPendingShiftLogs() {
+    try {
+        if (!fs.existsSync(CONFIG.pendingShiftLogsPath)) {
+            pendingShiftLogs = [];
+            return;
+        }
+
+        const parsed = JSON.parse(fs.readFileSync(CONFIG.pendingShiftLogsPath, "utf8"));
+        if (Array.isArray(parsed)) {
+            pendingShiftLogs = parsed;
+        } else if (parsed && Array.isArray(parsed.logs)) {
+            pendingShiftLogs = parsed.logs;
+        } else {
+            pendingShiftLogs = [];
+        }
+    } catch (error) {
+        console.error("Failed to load pending shift logs:", error.message);
+        pendingShiftLogs = [];
+    }
+}
+
+function persistPendingShiftLogs() {
+    const tmpPath = `${CONFIG.pendingShiftLogsPath}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify({ logs: pendingShiftLogs }, null, 2));
+    fs.renameSync(tmpPath, CONFIG.pendingShiftLogsPath);
+}
+
+function enqueueClosedShiftLog(machineId, state, endedAt) {
+    pendingShiftLogs.push({
+        id: `${machineId}-${Date.now()}-${state.shift ?? "x"}`,
+        machineId,
+        updatedTime: endedAt,
+        lastStopTime: state.lastStopTime || null,
+        lastStartTime: state.lastStartTime || null,
+        stop: state.stop,
+        stopsData: clone(state.stopsData || createEmptyStopsData()),
+        rawData: clone(state.rawData || []),
+        displayType: state.displayType,
+        stopCount: state.stopCount || 0,
+        shift: state.shift,
+    });
+
+    try {
+        persistPendingShiftLogs();
+        console.log(
+            `[${machineId}] Stored closed shift locally (${pendingShiftLogs.length} pending)`,
+        );
+    } catch (error) {
+        console.error(`[${machineId}] Failed to store closed shift:`, error.message);
+    }
+}
+
+function removePendingShiftLogs(ids) {
+    const remove = new Set(ids);
+    pendingShiftLogs = pendingShiftLogs.filter((log) => !remove.has(log.id));
+
+    try {
+        persistPendingShiftLogs();
+    } catch (error) {
+        console.error("Failed to update pending shift logs:", error.message);
+    }
+}
+
+async function flushPendingShiftLogs() {
+    if (!pendingShiftLogs.length) {
+        return;
+    }
+
+    const toFlush = pendingShiftLogs.slice();
+
+    await axiosInstance.post(`${CONFIG.apiBaseUrl}/machine-logs/shift`, {
+        logs: toFlush,
+        workspaceId: CONFIG.workspaceId,
+        apiKey: CONFIG.apiKey,
+    });
+
+    removePendingShiftLogs(toFlush.map((log) => log.id));
+    console.log(`Flushed ${toFlush.length} closed shift log(s)`);
 }
 
 /*
@@ -549,8 +666,14 @@ class HaiwellMachineReader {
             state.lastStopTime = nowUtc;
         }
 
+        const previousShift = state.shift;
         const previousShiftRaw = state.shiftRaw;
-        const panelShiftChanged = currentShiftRaw !== null && previousShiftRaw !== null && String(currentShiftRaw) !== String(previousShiftRaw);
+        const panelShiftChanged = hasShiftChanged(
+            previousShift,
+            previousShiftRaw,
+            currentShift,
+            currentShiftRaw,
+        );
 
         if (panelShiftChanged) {
             console.log(`[${this.machineId}] Shift changed: ` + `${previousShiftRaw} -> ${currentShiftRaw}`);
@@ -558,7 +681,7 @@ class HaiwellMachineReader {
                 completeCurrentStop(this.machineId);
                 state.lastStopTime = nowUtc;
             }
-            state.prevData = clone(state);
+            enqueueClosedShiftLog(this.machineId, state, nowUtc);
             state.stopCount = 0;
             state.stopsData = createEmptyStopsData();
             if (currentStop === 0) {
@@ -586,7 +709,7 @@ class HaiwellMachineReader {
         const shiftInfo = normalizeShift(this.values.get(IDS.currentShift));
         let rawData = [
             shiftInfo ? shiftInfo.number : null,
-            integerOrNull(this.values.get(IDS.stopReasonCode)) ? integerOrNull(this.values.get(IDS.stopReasonCode)) : 0,
+            integerOrNull(this.values.get(IDS.stopReasonCode)) ? (numberOrNull(this.values.get(IDS.loomSpeed)) >= 20 ? 0:  integerOrNull(this.values.get(IDS.stopReasonCode))) : 0,
             textOrNull(this.values.get(IDS.stopReasonText)) ? textOrNull(this.values.get(IDS.stopReasonText)) : '',
             numberOrNull(this.values.get(IDS.loomSpeed)),
             numberOrNull(this.values.get(IDS.weftDensityDisplay)),
@@ -867,16 +990,19 @@ async function dataPushLoop() {
             apiKey: CONFIG.apiKey,
         });
 
-        /*
-         * Clear prevData only after a successful upload.
-         */
-        for (const machineId of Object.keys(machineData)) {
-            if (machineData[machineId].prevData) {
-                machineData[machineId].prevData = null;
-            }
-        }
-
         dataPushDelay = CONFIG.dataPushIntervalMs;
+
+        try {
+            await flushPendingShiftLogs();
+        } catch (error) {
+            console.error(
+                new Date(),
+                "Shift log flush error:",
+                error.response && error.response.data
+                    ? error.response.data
+                    : error.message,
+            );
+        }
     } catch (error) {
         console.log(error)
         console.error(
@@ -921,6 +1047,7 @@ app.get("/health", (req, res) => {
         totalMachines: machineHealth.length,
         connectedMachines,
         disconnectedMachines: machineHealth.length - connectedMachines,
+        pendingShiftLogs: pendingShiftLogs.length,
         machines: machineHealth,
     });
 });
@@ -1036,6 +1163,11 @@ app.listen(CONFIG.port, async () => {
     console.log(`API: ${CONFIG.apiBaseUrl}`);
     console.log("Mode: application-level read-only");
     console.log("No SetById or page navigation is used");
+
+    loadPendingShiftLogs();
+    if (pendingShiftLogs.length) {
+        console.log(`Pending closed shift logs on disk: ${pendingShiftLogs.length}`);
+    }
 
     await initAllMachines();
 
