@@ -3,3 +3,5 @@ node_modules/
 .DS_Store
 test/
 shift-variable-output/
+pending-shift-logs.json
+pending-shift-logs.json.tmp
