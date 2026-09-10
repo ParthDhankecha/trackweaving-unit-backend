@@ -1,9 +1,3 @@
-// Tsudakoma air-jet loom reader for TrackWeaving
-// Node.js 12 and Windows 7 compatible build source.
-//
-// Build Windows 7 executable:
-//   pkg tsudakoma-reader-win7.js --targets node12-win-x64 --output trackweaving.exe
-
 "use strict";
 
 const express = require("express");
@@ -24,30 +18,63 @@ const FTP_PORT = toInteger(process.env.FTP_PORT, 21);
 const FTP_USERNAME = process.env.FTP_USERNAME || "anonymous";
 const FTP_PASSWORD = process.env.FTP_PASSWORD || "aaatccs@";
 const FTP_SECURE = /^true$/i.test(process.env.FTP_SECURE || "false");
-const FTP_TIMEOUT_MS = toInteger(process.env.FTP_TIMEOUT_MS, 30000);
 
-const POLL_INTERVAL_MS = toInteger(process.env.POLL_INTERVAL_MS, 10000);
+const FTP_TIMEOUT_MS = toInteger(process.env.FTP_TIMEOUT_MS, 7000);
+const FTP_FILE_RETRY_COUNT = toInteger(process.env.FTP_FILE_RETRY_COUNT, 2);
+const FTP_FILE_RETRY_DELAY_MS = toInteger(process.env.FTP_FILE_RETRY_DELAY_MS, 250);
+
+const POLL_INTERVAL_MS = toInteger(process.env.POLL_INTERVAL_MS, 5000);
+const PRODUCTION_POLL_INTERVAL_MS = toInteger(process.env.PRODUCTION_POLL_INTERVAL_MS, 40000);
+const TISS_POLL_INTERVAL_MS = toInteger(process.env.TISS_POLL_INTERVAL_MS, 60000);
+const AUTO_POLL_INTERVAL_MS = toInteger(process.env.AUTO_POLL_INTERVAL_MS, 3600000);
 const EVENT_POLL_INTERVAL_MS = toInteger(process.env.EVENT_POLL_INTERVAL_MS, 300000);
+
 const MACHINE_REFRESH_MS = toInteger(process.env.MACHINE_REFRESH_MS, 300000);
 const DATA_PUSH_INTERVAL_MS = toInteger(process.env.DATA_PUSH_INTERVAL_MS, 5000);
 const POWER_OFF_AFTER_MS = toInteger(process.env.POWER_OFF_AFTER_MS, 90000);
-const MAX_CONCURRENT_FTP = toInteger(process.env.MAX_CONCURRENT_FTP, 3);
+const MAX_CONCURRENT_FTP = toInteger(process.env.MAX_CONCURRENT_FTP, 16);
+const MAX_FAILURE_BACKOFF_MS = toInteger(process.env.MAX_FAILURE_BACKOFF_MS, 15000);
 const MIN_COUNTED_STOP_SECONDS = toInteger(process.env.MIN_COUNTED_STOP_SECONDS, 0);
+
 const LOOM_UTC_OFFSET = process.env.LOOM_UTC_OFFSET || "+05:30";
 const HTTP_PORT = toInteger(process.env.PORT, 3001);
 
 const POWER_OFF_STOP_CODE = 9999;
 const UNKNOWN_STOP_CODE = 9998;
 
-const RAW_INDEX = Object.freeze({ shift: 0, quality: 1, stopCode: 2, runTime: 3, efficiencyPercent: 4, currentDensity: 5, pieceLengthM: 6, picksCurrentShift: 7, beamLeft: 8, initialBeamLeft: 9, beamCompletionDate: 10, warpStopCount: 11, warpStopDuration: 12, h1StopCount: 13, h1StopDuration: 14, h2StopCount: 15, h2StopDuration: 16, otherStopCount: 17, otherStopDuration: 18, speedRpm: 19 });
+const RAW_INDEX = Object.freeze({
+    shift: 0,
+    quality: 1,
+    stopCode: 2,
+    runTime: 3,
+    efficiencyPercent: 4,
+    currentDensity: 5,
+    pieceLengthM: 6,
+    picksCurrentShift: 7,
+    beamLeft: 8,
+    initialBeamLeft: 9,
+    beamCompletionDate: 10,
+    warpStopCount: 11,
+    warpStopDuration: 12,
+    h1StopCount: 13,
+    h1StopDuration: 14,
+    h2StopCount: 15,
+    h2StopDuration: 16,
+    otherStopCount: 17,
+    otherStopDuration: 18,
+    speedRpm: 19
+});
 
-const axiosInstance = axios.create({ timeout: 15000, httpsAgent: new https.Agent({ keepAlive: false }) });
+const axiosInstance = axios.create({
+    timeout: 15000,
+    httpsAgent: new https.Agent({ keepAlive: false })
+});
 
 let machineData = {};
 const pollers = new Map();
 let shuttingDown = false;
 
-// ====== GENERAL HELPERS ======
+// ====== HELPERS ======
 function toInteger(value, fallback) {
     const parsed = Number.parseInt(value, 10);
     return Number.isFinite(parsed) ? parsed : fallback || 0;
@@ -59,15 +86,16 @@ function toNumber(value, fallback) {
 }
 
 function toSystemShift(rawShift) {
-    // Machine reports day shift = 1, night shift = 2; our system uses day = 0, night = 1.
     const shift = toInteger(rawShift);
     return shift > 0 ? shift - 1 : shift;
 }
 
 function round(value, decimals) {
     if (!Number.isFinite(value)) return 0;
+
     const decimalPlaces = decimals === undefined ? 1 : decimals;
     const factor = 10 ** decimalPlaces;
+
     return Math.round(value * factor) / factor;
 }
 
@@ -82,8 +110,17 @@ function utcNow() {
 function loomDateTimeToUtc(date, time) {
     const normalizedDate = String(date || "").trim().replace(/\//g, "-");
     const timeParts = String(time || "").trim().split(":");
-    const normalizedTime = timeParts.length === 3 ? `${timeParts[0].padStart(2, "0")}:${timeParts[1].padStart(2, "0")}:${timeParts[2].padStart(2, "0")}` : String(time || "").trim();
-    const parsed = moment.parseZone(`${normalizedDate}T${normalizedTime}${LOOM_UTC_OFFSET}`, "YYYY-MM-DDTHH:mm:ssZ", true);
+
+    const normalizedTime = timeParts.length === 3
+        ? `${timeParts[0].padStart(2, "0")}:${timeParts[1].padStart(2, "0")}:${timeParts[2].padStart(2, "0")}`
+        : String(time || "").trim();
+
+    const parsed = moment.parseZone(
+        `${normalizedDate}T${normalizedTime}${LOOM_UTC_OFFSET}`,
+        "YYYY-MM-DDTHH:mm:ssZ",
+        true
+    );
+
     return parsed.isValid() ? parsed.utc().format() : null;
 }
 
@@ -103,7 +140,17 @@ function ensureMachineData(machine) {
     const machineId = String(machine.id);
 
     if (!machineData[machineId]) {
-        machineData[machineId] = { displayType: machine.displayType || "tsudakoma", stopCount: 0, totalStopCount: 0, stopsData: blankStopsData(), lastStopTime: null, lastStartTime: null, stop: 0, shift: null, isPowerOff: false };
+        machineData[machineId] = {
+            displayType: machine.displayType || "tsudakoma",
+            stopCount: 0,
+            totalStopCount: 0,
+            stopsData: blankStopsData(),
+            lastStopTime: null,
+            lastStartTime: null,
+            stop: 0,
+            shift: null,
+            isPowerOff: false
+        };
     }
 
     const data = machineData[machineId];
@@ -118,7 +165,12 @@ function isTsudakomaMachine(machine) {
 
     if (!type) return true;
 
-    return ["tsudakoma", "tsudokuma", "tsudakoma-airjet", "tsudakoma_airjet"].includes(type);
+    return [
+        "tsudakoma",
+        "tsudokuma",
+        "tsudakoma-airjet",
+        "tsudakoma_airjet"
+    ].includes(type);
 }
 
 function resolveLoomNumber(machine) {
@@ -139,6 +191,7 @@ function resolveLoomNumber(machine) {
     throw new Error(`Cannot resolve Tsudakoma loom number for machine ${machine.id}`);
 }
 
+// ====== CSV ======
 function parseCsvLine(line) {
     const fields = [];
     let value = "";
@@ -168,7 +221,11 @@ function parseCsvLine(line) {
 }
 
 function parseCsvRows(text) {
-    return String(text || "").replace(/^\uFEFF/, "").split(/\r?\n/).filter((line) => line.length > 0).map(parseCsvLine);
+    return String(text || "")
+        .replace(/^\uFEFF/, "")
+        .split(/\r?\n/)
+        .filter((line) => line.length > 0)
+        .map(parseCsvLine);
 }
 
 // ====== FTP CONCURRENCY ======
@@ -186,7 +243,6 @@ class Semaphore {
         }
 
         await new Promise((resolve) => this.waiters.push(resolve));
-
         this.active += 1;
     }
 
@@ -194,7 +250,6 @@ class Semaphore {
         this.active = Math.max(0, this.active - 1);
 
         const next = this.waiters.shift();
-
         if (next) next();
     }
 
@@ -235,6 +290,32 @@ async function downloadText(client, remotePath) {
     return target.text();
 }
 
+function isRetryableFileError(error) {
+    const message = error && error.message ? error.message : String(error || "");
+
+    return message.indexOf("550") >= 0 || /file unavailable/i.test(message);
+}
+
+async function downloadTextWithRetry(client, remotePath) {
+    let lastError = null;
+
+    for (let attempt = 0; attempt <= FTP_FILE_RETRY_COUNT; attempt += 1) {
+        try {
+            return await downloadText(client, remotePath);
+        } catch (error) {
+            lastError = error;
+
+            if (attempt >= FTP_FILE_RETRY_COUNT || !isRetryableFileError(error)) {
+                throw error;
+            }
+
+            await sleep(FTP_FILE_RETRY_DELAY_MS * (attempt + 1));
+        }
+    }
+
+    throw lastError;
+}
+
 function ftpCredentials(machine) {
     return {
         user: machine.ftpUsername || machine.ftpUser || FTP_USERNAME,
@@ -242,53 +323,92 @@ function ftpCredentials(machine) {
     };
 }
 
-async function readLoomFiles(machine, includeEvents) {
+// ====== READ LOOM FILES ======
+async function readLoomFiles(machine, options) {
     async function readFiles() {
         const client = new ftp.Client(FTP_TIMEOUT_MS);
         client.prepareTransfer = ftp.enterPassiveModeIPv4;
-        client.ftp.verbose = /^true$/i.test(process.env.FTP_VERBOSE || "true");
+        client.ftp.verbose = /^true$/i.test(process.env.FTP_VERBOSE || "false");
+
         const credentials = ftpCredentials(machine);
         const loomNo = resolveLoomNumber(machine);
 
-        client.ftp.verbose = /^true$/i.test(process.env.FTP_VERBOSE || "false");
+        const readOptions = options && typeof options === "object"
+            ? options
+            : {
+                includeProduction: true,
+                includeTiss: true,
+                includeAuto: true,
+                includeEvents: Boolean(options)
+            };
+
+        const files = {};
+        const startedAt = Date.now();
 
         try {
-            await client.access({ host: machine.ip, port: toInteger(machine.ftpPort, FTP_PORT), user: credentials.user, password: credentials.password, secure: FTP_SECURE });
+            await client.access({
+                host: machine.ip,
+                port: toInteger(machine.ftpPort, FTP_PORT),
+                user: credentials.user,
+                password: credentials.password,
+                secure: FTP_SECURE
+            });
 
-            const files = {};
+            // Live status is mandatory.
+            files.status = await downloadTextWithRetry(client, "I_STATUS.CSV");
 
-            files.status = await downloadText(client, "I_STATUS.CSV");
-            files.shiftProduction = await downloadText(client, "I_SHIFTPRD.CSV");
-
-            try {
-                files.tissStatus = await downloadText(client, `${loomNo}_I_TISS_STATUS.CSV`);
-            } catch (error) {
-                files.tissStatusError = error && error.message ? error.message : String(error);
-            }
-            try {
-                files.autoSettings = await downloadText(client, "I_AUTO.CSV");
-                files.autoSettingsError = null;
-            } catch (error) {
-                files.autoSettingsError = error && error.message ? error.message : String(error);
-            }
-            if (includeEvents) {
+            if (readOptions.includeProduction) {
                 try {
-                    files.shiftEvents = await downloadText(client, "I_SHIFTEVT.CSV");
+                    files.shiftProduction = await downloadTextWithRetry(client, "I_SHIFTPRD.CSV");
+                } catch (error) {
+                    files.shiftProductionError = error && error.message ? error.message : String(error);
+                }
+            }
+
+            if (readOptions.includeTiss) {
+                try {
+                    files.tissStatus = await downloadTextWithRetry(client, `${loomNo}_I_TISS_STATUS.CSV`);
+                } catch (error) {
+                    files.tissStatusError = error && error.message ? error.message : String(error);
+                }
+            }
+
+            if (readOptions.includeAuto) {
+                try {
+                    files.autoSettings = await downloadTextWithRetry(client, "I_AUTO.CSV");
+                    files.autoSettingsError = null;
+                } catch (error) {
+                    files.autoSettingsError = error && error.message ? error.message : String(error);
+                }
+            }
+
+            if (readOptions.includeEvents) {
+                try {
+                    files.shiftEvents = await downloadTextWithRetry(client, "I_SHIFTEVT.CSV");
                 } catch (error) {
                     files.shiftEventsError = error && error.message ? error.message : String(error);
                 }
             }
 
-            return { files, loomNo };
+            return {
+                files,
+                loomNo,
+                readDurationMs: Date.now() - startedAt
+            };
         } finally {
             client.close();
         }
     }
 
-    return ftpSemaphore.use(readFiles);
+    const queueStartedAt = Date.now();
+    const result = await ftpSemaphore.use(readFiles);
+
+    result.queueWaitMs = Math.max(0, Date.now() - queueStartedAt - result.readDurationMs);
+
+    return result;
 }
 
-// ====== CSV PARSERS ======
+// ====== PARSERS ======
 function parseStatusCsv(text) {
     const rows = parseCsvRows(text);
 
@@ -300,6 +420,7 @@ function parseStatusCsv(text) {
     const runFlag = toInteger(row[2]);
     const rawStopCode = toInteger(row[4]);
     const currentStop = runFlag === 1 ? 0 : rawStopCode || UNKNOWN_STOP_CODE;
+
     const beamOriginalMeter = toNumber(row[24]) / 10;
     const beamConsumedMeter = toNumber(row[26]) / 10;
     const beamLeftMeter = Math.max(0, beamOriginalMeter - beamConsumedMeter);
@@ -344,7 +465,10 @@ function parseShiftProductionCsv(text) {
     const unavailableMinutes = toNumber(row[11]) / 10;
     const totalStopCount = toInteger(row[15]);
 
-    const millEfficiency = elapsedMinutes > 0 ? (availableMinutes / elapsedMinutes) * 100 : toNumber(row[19]) / 10;
+    const millEfficiency = elapsedMinutes > 0
+        ? (availableMinutes / elapsedMinutes) * 100
+        : toNumber(row[19]) / 10;
+
     const loomEfficiency = toNumber(row[19]) / 10;
     const calculatedShiftPicks = Math.max(0, Math.round(toNumber(row[9]) * 100));
 
@@ -403,7 +527,21 @@ function parseAutoSettingsCsv(text) {
     };
 }
 
-const STOP_CODE = Object.freeze({ 20: { reason: "H1 feeler C1", bucket: "h1", group: "filling" }, 21: { reason: "H1 feeler C2", bucket: "h1", group: "filling" }, 25: { reason: "H2 feeler C1", bucket: "h2", group: "filling" }, 26: { reason: "H2 feeler C2", bucket: "h2", group: "filling" }, 31: { reason: "Dropper", bucket: "warp", group: "warp" }, 41: { reason: "Leno left", bucket: "other", group: "other" }, 42: { reason: "Leno right", bucket: "other", group: "other" }, 43: { reason: "CC", bucket: "warp", group: "warp" }, 50: { reason: "Package sensor C1", bucket: "h1", group: "h1" }, 51: { reason: "Package sensor C2", bucket: "h1", group: "h1" }, 71: { reason: "Counter", bucket: "other", group: "other" }, 11: { reason: "Stop button", bucket: "manual", group: "other" } });
+// ====== STOP CODES ======
+const STOP_CODE = Object.freeze({
+    20: { reason: "H1 feeler C1", bucket: "h1", group: "filling" },
+    21: { reason: "H1 feeler C2", bucket: "h1", group: "filling" },
+    25: { reason: "H2 feeler C1", bucket: "h2", group: "filling" },
+    26: { reason: "H2 feeler C2", bucket: "h2", group: "filling" },
+    31: { reason: "Dropper", bucket: "warp", group: "warp" },
+    41: { reason: "Leno left", bucket: "other", group: "other" },
+    42: { reason: "Leno right", bucket: "other", group: "other" },
+    43: { reason: "CC", bucket: "warp", group: "warp" },
+    50: { reason: "Package sensor C1", bucket: "h1", group: "h1" },
+    51: { reason: "Package sensor C2", bucket: "h1", group: "h1" },
+    71: { reason: "Counter", bucket: "other", group: "other" },
+    11: { reason: "Stop button", bucket: "manual", group: "other" }
+});
 
 function stopDefinition(code) {
     return STOP_CODE[code] || {
@@ -413,6 +551,7 @@ function stopDefinition(code) {
     };
 }
 
+// ====== EVENTS ======
 function parseCurrentShiftEvents(text) {
     if (!text) return null;
 
@@ -438,7 +577,18 @@ function parseCurrentShiftEvents(text) {
 
         const definition = stopDefinition(code);
 
-        events.push({ start, end: moment.utc(start).add(durationSeconds, "seconds").format(), statusCode: code, duration: durationSeconds, reason: definition.reason, group: definition.group, bucket: definition.bucket, doffNo: toInteger(group[2]), clothLengthMeter: toNumber(group[3]) / 10, eventKey: `${start}|${code}|${group[2]}|${group[3]}` });
+        events.push({
+            start,
+            end: moment.utc(start).add(durationSeconds, "seconds").format(),
+            statusCode: code,
+            duration: durationSeconds,
+            reason: definition.reason,
+            group: definition.group,
+            bucket: definition.bucket,
+            doffNo: toInteger(group[2]),
+            clothLengthMeter: toNumber(group[3]) / 10,
+            eventKey: `${start}|${code}|${group[2]}|${group[3]}`
+        });
     }
 
     return { shiftDate, shift, events, raw: row };
@@ -449,16 +599,29 @@ function buildStopsData(events) {
 
     for (const event of events) {
         const bucket = stopsData[event.bucket] ? event.bucket : "other";
-        const cleanEntry = { start: event.start, end: event.end, statusCode: event.statusCode, duration: event.duration, reason: event.reason, doffNo: event.doffNo, clothLengthMeter: event.clothLengthMeter };
 
-        stopsData[bucket].push(cleanEntry);
+        stopsData[bucket].push({
+            start: event.start,
+            end: event.end,
+            statusCode: event.statusCode,
+            duration: event.duration,
+            reason: event.reason,
+            doffNo: event.doffNo,
+            clothLengthMeter: event.clothLengthMeter
+        });
     }
 
     return stopsData;
 }
 
 function summarizeStops(events) {
-    const summary = { total: { count: 0, durationSeconds: 0 }, filling: { count: 0, durationSeconds: 0 }, warp: { count: 0, durationSeconds: 0 }, other: { count: 0, durationSeconds: 0 }, byCode: {} };
+    const summary = {
+        total: { count: 0, durationSeconds: 0 },
+        filling: { count: 0, durationSeconds: 0 },
+        warp: { count: 0, durationSeconds: 0 },
+        other: { count: 0, durationSeconds: 0 },
+        byCode: {}
+    };
 
     for (const event of events) {
         summary.total.count += 1;
@@ -472,7 +635,12 @@ function summarizeStops(events) {
         const key = String(event.statusCode);
 
         if (!summary.byCode[key]) {
-            summary.byCode[key] = { code: event.statusCode, reason: event.reason, count: 0, durationSeconds: 0 };
+            summary.byCode[key] = {
+                code: event.statusCode,
+                reason: event.reason,
+                count: 0,
+                durationSeconds: 0
+            };
         }
 
         summary.byCode[key].count += 1;
@@ -482,18 +650,29 @@ function summarizeStops(events) {
     return summary;
 }
 
-// ====== MACHINE PROCESSING ======
+// ====== STOP PROCESSING ======
 function closeLiveStop(machineState, endTime) {
     if (!machineState.lastStopTime || !machineState.stop) return;
 
-    const duration = Math.max(0, moment.utc(endTime).diff(moment.utc(machineState.lastStopTime), "seconds"));
+    const duration = Math.max(
+        0,
+        moment.utc(endTime).diff(moment.utc(machineState.lastStopTime), "seconds")
+    );
 
     if (duration < MIN_COUNTED_STOP_SECONDS) return;
 
-    const definition = machineState.stop === POWER_OFF_STOP_CODE ? { reason: "Power Off", bucket: "other", group: "other" } : stopDefinition(machineState.stop);
-    const entry = { start: machineState.lastStopTime, end: endTime, statusCode: machineState.stop, duration, reason: definition.reason };
+    const definition = machineState.stop === POWER_OFF_STOP_CODE
+        ? { reason: "Power Off", bucket: "other", group: "other" }
+        : stopDefinition(machineState.stop);
 
-    machineState.stopsData[definition.bucket].push(entry);
+    machineState.stopsData[definition.bucket].push({
+        start: machineState.lastStopTime,
+        end: endTime,
+        statusCode: machineState.stop,
+        duration,
+        reason: definition.reason
+    });
+
     machineState.stopCount += 1;
 }
 
@@ -519,11 +698,15 @@ function aggregateStopBucket(stopsData, bucketNames) {
     const entries = bucketNames.flatMap((name) => stopsData[name] || []);
     const durationSeconds = entries.reduce((total, entry) => total + (entry.duration || 0), 0);
 
-    return { count: entries.length, durationSeconds };
+    return {
+        count: entries.length,
+        durationSeconds
+    };
 }
 
 function buildNormalizedRawData(values, stopsData) {
     const data = Array(Object.keys(RAW_INDEX).length).fill(0);
+
     const warp = aggregateStopBucket(stopsData, ["warp"]);
     const h1 = aggregateStopBucket(stopsData, ["h1"]);
     const h2 = aggregateStopBucket(stopsData, ["h2", "feeder"]);
@@ -553,64 +736,196 @@ function buildNormalizedRawData(values, stopsData) {
     return data;
 }
 
+// ====== MACHINE PROCESSING ======
 function processLoomData(machine, result, fetchedAt) {
     const machineId = String(machine.id);
     const state = ensureMachineData(machine);
     const status = parseStatusCsv(result.files.status);
-    const production = parseShiftProductionCsv(result.files.shiftProduction);
-    const tiss = parseTissStatusCsv(result.files.tissStatus);
-    const autoSettings = parseAutoSettingsCsv(result.files.autoSettings);
-    const events = parseCurrentShiftEvents(result.files.shiftEvents);
+
+    let production = null;
+    let tiss = null;
+    let autoSettings = null;
+    let events = null;
+
+    if (result.files.shiftProduction) {
+        production = parseShiftProductionCsv(result.files.shiftProduction);
+        state.cachedProduction = production;
+    } else {
+        production = state.cachedProduction || null;
+    }
+
+    if (result.files.tissStatus) {
+        tiss = parseTissStatusCsv(result.files.tissStatus);
+
+        if (tiss) {
+            state.cachedTissStatus = tiss;
+        }
+    } else {
+        tiss = state.cachedTissStatus || null;
+    }
+
+    if (result.files.autoSettings) {
+        autoSettings = parseAutoSettingsCsv(result.files.autoSettings);
+
+        if (autoSettings) {
+            state.cachedAutoSettings = autoSettings;
+        }
+    } else {
+        autoSettings = state.cachedAutoSettings || null;
+    }
+
+    if (result.files.shiftEvents) {
+        events = parseCurrentShiftEvents(result.files.shiftEvents);
+
+        if (events) {
+            state.cachedEvents = events;
+        }
+    }
+
     const previousShift = state.shift;
 
-    if (Number.isFinite(previousShift) && previousShift !== production.shift) {
+    const currentShift = production
+        ? production.shift
+        : Number.isFinite(previousShift)
+        ? previousShift
+        : 0;
+
+    if (
+        production &&
+        Number.isFinite(previousShift) &&
+        previousShift !== production.shift
+    ) {
         state.prevData = JSON.parse(JSON.stringify(state));
         state.stopCount = 0;
         state.totalStopCount = 0;
         state.stopsData = blankStopsData();
         state.stopSummary = summarizeStops([]);
+        state.cachedEvents = null;
     }
 
-    if (state.isPowerOff && state.stop === POWER_OFF_STOP_CODE) {
-        applyStopTransition(state, status.currentStop, fetchedAt);
-    } else {
-        applyStopTransition(state, status.currentStop, status.sourceTimestamp || fetchedAt);
-    }
+    /*
+     * IMPORTANT:
+     * Use fetchedAt for LIVE stop transitions.
+     * Do not use an old Tsudakoma source timestamp here.
+     */
+    applyStopTransition(state, status.currentStop, fetchedAt);
 
-    if (events && events.shift === production.shift) {
+    if (events && events.shift === currentShift) {
         state.stopsData = buildStopsData(events.events);
         state.stopSummary = summarizeStops(events.events);
         state.stopCount = events.events.length;
-        state.totalStopCount = production.totalStopCount || events.events.length;
+
+        state.totalStopCount = production && production.totalStopCount
+            ? production.totalStopCount
+            : events.events.length;
+
         state.lastEventSyncAt = fetchedAt;
 
-        if (status.currentStop !== 0) {
-            const latestMatchingEvent = [...events.events].reverse().find((event) => event.statusCode === status.currentStop);
-
-            if (latestMatchingEvent) state.lastStopTime = latestMatchingEvent.start;
-        }
-    } else {
+        /*
+         * Do NOT overwrite lastStopTime by finding an old event
+         * having the same stop code.
+         */
+    } else if (production) {
         state.totalStopCount = production.totalStopCount;
     }
 
-    const averageRpm = production.rpm;
-    const assumedCurrentRpm = tiss && tiss.assumedCurrentOrSetRpm ? tiss.assumedCurrentOrSetRpm : averageRpm;
-    const currentRpm = status.runFlag === 1 ? assumedCurrentRpm : 0;
-    const tissDensity = tiss && tiss.assumedWeftDensity ? tiss.assumedWeftDensity : 0;
-    const autoDensity = autoSettings && autoSettings.weftDensity ? autoSettings.weftDensity : 0;
-    const configuredDensity = toNumber(machine.setPicks) || toNumber(machine.currentDensity) || toNumber(machine.weftDensity);
-    const weftDensity = tissDensity || autoDensity || configuredDensity;
-    const currentShiftPicks = status.directClothPicks > 0 ? Math.round(status.directClothPicks) : production.calculatedShiftPicks;
-    const beamCompletionDatetime = status.beamRemainingHours > 0 ? moment.utc(fetchedAt).add(status.beamRemainingHours, "hours").format() : null;
+    const averageRpm = production
+        ? production.rpm
+        : toNumber(state.averageRpm);
 
-    const normalized = { loomNo: result.loomNo, shift: production.shift, quality: production.styleNo, currentStop: status.currentStop, currentStopReason: status.currentStop ? stopDefinition(status.currentStop).reason : null, runFlag: status.runFlag, runtimeMinutes: production.runtimeMinutes, millEfficiency: production.millEfficiency, loomEfficiency: production.loomEfficiency, efficiency: production.loomEfficiency, averageRpm, currentRpm, productionMeter: production.productionMeter, currentPieceMeter: status.currentPieceMeter, currentShiftPicks, beamOriginalMeter: status.beamOriginalMeter, beamConsumedMeter: status.beamConsumedMeter, beamLeftMeter: status.beamLeftMeter, beamRemainingHours: status.beamRemainingHours, beamCompletionDatetime, weftDensity, totalStopCount: production.totalStopCount, doffNo: status.doffNo };
+    const assumedCurrentRpm = tiss && tiss.assumedCurrentOrSetRpm
+        ? tiss.assumedCurrentOrSetRpm
+        : averageRpm;
+
+    const currentRpm = status.runFlag === 1 ? assumedCurrentRpm : 0;
+
+    const tissDensity = tiss && tiss.assumedWeftDensity
+        ? tiss.assumedWeftDensity
+        : 0;
+
+    const autoDensity = autoSettings && autoSettings.weftDensity
+        ? autoSettings.weftDensity
+        : 0;
+
+    const configuredDensity =
+        toNumber(machine.setPicks) ||
+        toNumber(machine.currentDensity) ||
+        toNumber(machine.weftDensity) ||
+        toNumber(state.weftDensity);
+
+    const weftDensity = tissDensity || autoDensity || configuredDensity;
+
+    const calculatedShiftPicks = production
+        ? production.calculatedShiftPicks
+        : toNumber(state.currentShiftPicks);
+
+    const currentShiftPicks = status.directClothPicks > 0
+        ? Math.round(status.directClothPicks)
+        : calculatedShiftPicks;
+
+    const beamCompletionDatetime = status.beamRemainingHours > 0
+        ? moment.utc(fetchedAt).add(status.beamRemainingHours, "hours").format()
+        : null;
+
+    const runtimeMinutes = production
+        ? production.runtimeMinutes
+        : toNumber(state.runtimeMinutes || state.runtime);
+
+    const millEfficiency = production
+        ? production.millEfficiency
+        : toNumber(state.millEfficiency || state.efficiency);
+
+    const loomEfficiency = production
+        ? production.loomEfficiency
+        : toNumber(state.loomEfficiency || state.efficiency);
+
+    const productionMeter = production
+        ? production.productionMeter
+        : toNumber(state.productionMeter);
+
+    const styleNo = production
+        ? production.styleNo
+        : state.quality || "";
+
+    const totalStopCount = production
+        ? production.totalStopCount
+        : toInteger(state.totalStopCount);
+
+    const normalized = {
+        loomNo: result.loomNo,
+        shift: currentShift,
+        quality: styleNo,
+        currentStop: status.currentStop,
+        currentStopReason: status.currentStop ? stopDefinition(status.currentStop).reason : null,
+        runFlag: status.runFlag,
+        runtimeMinutes,
+        millEfficiency,
+        loomEfficiency,
+        efficiency: loomEfficiency,
+        averageRpm,
+        currentRpm,
+        productionMeter,
+        currentPieceMeter: status.currentPieceMeter,
+        currentShiftPicks,
+        beamOriginalMeter: status.beamOriginalMeter,
+        beamConsumedMeter: status.beamConsumedMeter,
+        beamLeftMeter: status.beamLeftMeter,
+        beamRemainingHours: status.beamRemainingHours,
+        beamCompletionDatetime,
+        weftDensity,
+        totalStopCount,
+        doffNo: status.doffNo
+    };
 
     state.updatedTime = fetchedAt;
     state.lastSuccessfulReadAt = fetchedAt;
+    state.lastStatusSourceTimestamp = status.sourceTimestamp || null;
     state.firstConnectionFailureAt = null;
     state.isPowerOff = false;
     state.readError = null;
-    state.shift = production.shift;
+
+    state.shift = currentShift;
+    state.quality = normalized.quality;
     state.speed = normalized.currentRpm;
     state.averageRpm = normalized.averageRpm;
     state.runtime = normalized.runtimeMinutes;
@@ -626,19 +941,47 @@ function processLoomData(machine, result, fetchedAt) {
     state.currentPieceMeter = normalized.currentPieceMeter;
     state.doffNo = normalized.doffNo;
     state.currentStopReason = normalized.currentStopReason;
+
     state.rawData = buildNormalizedRawData(normalized, state.stopsData);
-    state.source = { loomStatusTimestamp: status.sourceTimestamp, shiftProductionTimestamp: production.sourceTimestamp, tissStatusTimestamp: tiss && tiss.sourceTimestamp ? tiss.sourceTimestamp : null, collectedAt: fetchedAt, ftpIp: machine.ip, loomNo: result.loomNo, provisionalFields: { currentRpm: "TISS status field 6 / 10", weftDensity: "TISS status field 16 / 10" } };
-    state.tsudakomaRaw = { status: status.raw, shiftProduction: production.raw, tissStatus: tiss && tiss.raw ? tiss.raw : null };
+
+    state.source = {
+        loomStatusTimestamp: status.sourceTimestamp,
+        shiftProductionTimestamp: production && production.sourceTimestamp
+            ? production.sourceTimestamp
+            : null,
+        tissStatusTimestamp: tiss && tiss.sourceTimestamp
+            ? tiss.sourceTimestamp
+            : null,
+        collectedAt: fetchedAt,
+        ftpIp: machine.ip,
+        loomNo: result.loomNo,
+        provisionalFields: {
+            currentRpm: "TISS status field 6 / 10",
+            weftDensity: "TISS status field 16 / 10"
+        }
+    };
+
+    state.tsudakomaRaw = {
+        status: status.raw,
+        shiftProduction: production && production.raw ? production.raw : null,
+        tissStatus: tiss && tiss.raw ? tiss.raw : null
+    };
 
     return machineData[machineId];
 }
 
+// ====== POWER OFF ======
 function markMachinePowerOff(machine, error) {
     const state = ensureMachineData(machine);
     const now = utcNow();
-    const lastSuccess = state.lastSuccessfulReadAt ? moment.utc(state.lastSuccessfulReadAt) : null;
 
-    if (!state.firstConnectionFailureAt) state.firstConnectionFailureAt = now;
+    const lastSuccess = state.lastSuccessfulReadAt
+        ? moment.utc(state.lastSuccessfulReadAt)
+        : null;
+
+    if (!state.firstConnectionFailureAt) {
+        state.firstConnectionFailureAt = now;
+    }
 
     const offlineFrom = lastSuccess || moment.utc(state.firstConnectionFailureAt);
     const offlineForMs = moment.utc(now).diff(offlineFrom);
@@ -668,6 +1011,9 @@ async function pollLoop(machine, control, initialDelayMs) {
 
     await sleep(initialDelayMs);
 
+    let lastProductionPollAt = 0;
+    let lastTissPollAt = 0;
+    let lastAutoPollAt = 0;
     let lastEventPollAt = 0;
     let backoffMs = POLL_INTERVAL_MS;
 
@@ -675,29 +1021,102 @@ async function pollLoop(machine, control, initialDelayMs) {
         const startedAt = Date.now();
 
         try {
-            const includeEvents = !lastEventPollAt || startedAt - lastEventPollAt >= EVENT_POLL_INTERVAL_MS;
-            const result = await readLoomFiles(control.machine, includeEvents);
+            const includeProduction =
+                !lastProductionPollAt ||
+                startedAt - lastProductionPollAt >= PRODUCTION_POLL_INTERVAL_MS;
+
+            const includeTiss =
+                !lastTissPollAt ||
+                startedAt - lastTissPollAt >= TISS_POLL_INTERVAL_MS;
+
+            const includeAuto =
+                !lastAutoPollAt ||
+                startedAt - lastAutoPollAt >= AUTO_POLL_INTERVAL_MS;
+
+            const includeEvents =
+                !lastEventPollAt ||
+                startedAt - lastEventPollAt >= EVENT_POLL_INTERVAL_MS;
+
+            const result = await readLoomFiles(control.machine, {
+                includeProduction,
+                includeTiss,
+                includeAuto,
+                includeEvents
+            });
+
             const fetchedAt = utcNow();
 
             processLoomData(control.machine, result, fetchedAt);
 
-            if (includeEvents && result.files.shiftEvents) lastEventPollAt = startedAt;
+            if (includeProduction) lastProductionPollAt = startedAt;
+            if (includeTiss) lastTissPollAt = startedAt;
+            if (includeAuto) lastAutoPollAt = startedAt;
+            if (includeEvents) lastEventPollAt = startedAt;
 
             backoffMs = POLL_INTERVAL_MS;
 
-            console.log(`[${fetchedAt}] ${control.machine.ip} L${String(result.loomNo).padStart(3, "0")}`, `stop=${machineData[machineId].stop}`, `rpm=${machineData[machineId].speed}`, `eff=${machineData[machineId].efficiency}`, `meter=${machineData[machineId].productionMeter}`);
+            const sourceAgeSeconds = machineData[machineId].lastStatusSourceTimestamp
+                ? Math.max(
+                    0,
+                    moment.utc(fetchedAt).diff(
+                        moment.utc(machineData[machineId].lastStatusSourceTimestamp),
+                        "seconds"
+                    )
+                )
+                : -1;
+
+            console.log(
+                `[${fetchedAt}] ${control.machine.ip} L${String(result.loomNo).padStart(3, "0")}`,
+                `stop=${machineData[machineId].stop}`,
+                `rpm=${machineData[machineId].speed}`,
+                `eff=${machineData[machineId].efficiency}`,
+                `meter=${machineData[machineId].productionMeter}`,
+                `queue=${result.queueWaitMs}ms`,
+                `read=${result.readDurationMs}ms`,
+                `sourceAge=${sourceAgeSeconds}s`
+            );
+
+            if (result.files.shiftProductionError) {
+                console.warn(
+                    `[${fetchedAt}] ${control.machine.ip} I_SHIFTPRD.CSV skipped: ${result.files.shiftProductionError}`
+                );
+            }
+
+            if (result.files.tissStatusError) {
+                console.warn(
+                    `[${fetchedAt}] ${control.machine.ip} TISS status skipped: ${result.files.tissStatusError}`
+                );
+            }
+
+            if (result.files.autoSettingsError) {
+                console.warn(
+                    `[${fetchedAt}] ${control.machine.ip} I_AUTO.CSV skipped: ${result.files.autoSettingsError}`
+                );
+            }
+
+            if (result.files.shiftEventsError) {
+                console.warn(
+                    `[${fetchedAt}] ${control.machine.ip} I_SHIFTEVT.CSV skipped: ${result.files.shiftEventsError}`
+                );
+            }
         } catch (error) {
-            console.error(`[${utcNow()}] FTP read failed for ${control.machine.ip}:`, error && error.message ? error.message : error);
+            console.error(
+                `[${utcNow()}] FTP status read failed for ${control.machine.ip}:`,
+                error && error.message ? error.message : error
+            );
 
             markMachinePowerOff(control.machine, error);
 
-            backoffMs = Math.min(Math.max(5000, Math.round(backoffMs * 1.5)), 60000);
+            backoffMs = Math.min(
+                Math.max(POLL_INTERVAL_MS, Math.round(backoffMs * 1.5)),
+                MAX_FAILURE_BACKOFF_MS
+            );
         }
 
         const elapsed = Date.now() - startedAt;
-        const jitter = Math.floor(Math.random() * 2000);
+        const jitter = Math.floor(Math.random() * 500);
 
-        await sleep(Math.max(1000, backoffMs - elapsed) + jitter);
+        await sleep(Math.max(500, backoffMs - elapsed) + jitter);
     }
 }
 
@@ -711,14 +1130,19 @@ function startOrUpdatePoller(machine, index) {
         return;
     }
 
-    const control = { machine, cancelled: false };
+    const control = {
+        machine,
+        cancelled: false
+    };
 
     pollers.set(id, control);
     ensureMachineData(machine);
 
-    const initialDelayMs = (index % Math.max(1, MAX_CONCURRENT_FTP * 10)) * 1000;
+    const initialDelayMs = index * 100;
 
-    pollLoop(machine, control, initialDelayMs).catch((error) => handlePollLoopError(error, id));
+    pollLoop(machine, control, initialDelayMs).catch((error) => {
+        handlePollLoopError(error, id);
+    });
 }
 
 function handlePollLoopError(error, machineId) {
@@ -726,8 +1150,15 @@ function handlePollLoopError(error, machineId) {
     pollers.delete(machineId);
 }
 
+// ====== MACHINE LIST ======
 async function fetchMachines() {
-    const response = await axiosInstance.post(`${API_BASE_URL}/machine-logs/machine-list`, { workspaceId: WORKSPACE_ID, apiKey: API_KEY });
+    const response = await axiosInstance.post(
+        `${API_BASE_URL}/machine-logs/machine-list`,
+        {
+            workspaceId: WORKSPACE_ID,
+            apiKey: API_KEY
+        }
+    );
 
     return response.data && response.data.data ? response.data.data : {};
 }
@@ -741,13 +1172,17 @@ async function machineRefreshLoop() {
             const serverMachineData = initData.machineData || {};
 
             for (const [machineId, data] of Object.entries(serverMachineData)) {
-                if (!machineData[machineId]) machineData[machineId] = data;
+                if (!machineData[machineId]) {
+                    machineData[machineId] = data;
+                }
             }
 
             const machines = (initData.machines || []).filter(isTsudakomaMachine);
             const activeIds = new Set(machines.map((machine) => String(machine.id)));
 
-            machines.forEach((machine, index) => startOrUpdatePoller(machine, index));
+            machines.forEach((machine, index) => {
+                startOrUpdatePoller(machine, index);
+            });
 
             for (const [id, control] of pollers.entries()) {
                 if (!activeIds.has(id)) {
@@ -760,7 +1195,10 @@ async function machineRefreshLoop() {
 
             retryMs = MACHINE_REFRESH_MS;
         } catch (error) {
-            console.error("Error fetching machine list:", error && error.message ? error.message : error);
+            console.error(
+                "Error fetching machine list:",
+                error && error.message ? error.message : error
+            );
 
             retryMs = Math.min(retryMs * 2, 60000);
         }
@@ -769,7 +1207,7 @@ async function machineRefreshLoop() {
     }
 }
 
-// ====== DATA UPLOAD ======
+// ====== DATA PUSH ======
 async function dataPushLoop() {
     let delayMs = DATA_PUSH_INTERVAL_MS;
 
@@ -778,22 +1216,48 @@ async function dataPushLoop() {
             const dataToSend = {};
 
             for (const [machineId, data] of Object.entries(machineData)) {
-                if (data.updatedTime && moment.utc().diff(moment.utc(data.updatedTime), "hours") < 1) {
-                    dataToSend[machineId] = { displayType: data.displayType, lastStopTime: data.lastStopTime, lastStartTime: data.lastStartTime, prevData: data.prevData, stopCount: data.stopCount, stopsData: data.stopsData, stop: data.stop, powerOff: data.isPowerOff, rawData: data.rawData, shift: data.shift };
+                if (
+                    data.updatedTime &&
+                    moment.utc().diff(moment.utc(data.updatedTime), "hours") < 1
+                ) {
+                    dataToSend[machineId] = {
+                        displayType: data.displayType,
+                        lastStopTime: data.lastStopTime,
+                        lastStartTime: data.lastStartTime,
+                        prevData: data.prevData,
+                        stopCount: data.stopCount,
+                        stopsData: data.stopsData,
+                        stop: data.stop,
+                        powerOff: data.isPowerOff,
+                        rawData: data.rawData,
+                        shift: data.shift
+                    };
                 }
             }
 
             if (Object.keys(dataToSend).length) {
-                await axiosInstance.post(`${API_BASE_URL}/machine-logs`, { logs: dataToSend, workspaceId: WORKSPACE_ID, apiKey: API_KEY });
+                await axiosInstance.post(
+                    `${API_BASE_URL}/machine-logs`,
+                    {
+                        logs: dataToSend,
+                        workspaceId: WORKSPACE_ID,
+                        apiKey: API_KEY
+                    }
+                );
 
                 for (const machineId of Object.keys(dataToSend)) {
-                    if (machineData[machineId] && machineData[machineId].prevData) machineData[machineId].prevData = null;
+                    if (machineData[machineId] && machineData[machineId].prevData) {
+                        machineData[machineId].prevData = null;
+                    }
                 }
             }
 
             delayMs = DATA_PUSH_INTERVAL_MS;
         } catch (error) {
-            console.error(`[${utcNow()}] Data upload failed:`, error && error.message ? error.message : error);
+            console.error(
+                `[${utcNow()}] Data upload failed:`,
+                error && error.message ? error.message : error
+            );
 
             delayMs = Math.min(delayMs * 2, 60000);
         }
@@ -802,20 +1266,40 @@ async function dataPushLoop() {
     }
 }
 
-// ====== HTTP AND PROCESS LIFECYCLE ======
+// ====== HEALTH ======
 function healthHandler(req, res) {
-    const machines = Object.entries(machineData).map(([id, data]) => ({ id, updatedTime: data.updatedTime || null, stop: data.stop, isPowerOff: Boolean(data.isPowerOff), readError: data.readError || null }));
+    const machines = Object.entries(machineData).map(([id, data]) => ({
+        id,
+        updatedTime: data.updatedTime || null,
+        stop: data.stop,
+        isPowerOff: Boolean(data.isPowerOff),
+        readError: data.readError || null
+    }));
 
-    res.json({ ok: true, time: utcNow(), machineCount: machines.length, activePollers: pollers.size, machines });
+    res.json({
+        ok: true,
+        time: utcNow(),
+        machineCount: machines.length,
+        activePollers: pollers.size,
+        machines
+    });
 }
 
 app.get("/health", healthHandler);
 
 function healthServerStarted() {
     console.log(`Tsudakoma reader health server: http://localhost:${HTTP_PORT}/health`);
-    console.log(`FTP polling every ${POLL_INTERVAL_MS} ms, events every ${EVENT_POLL_INTERVAL_MS} ms,`, `max FTP sessions ${MAX_CONCURRENT_FTP}`);
+
+    console.log(
+        `FTP status every ${POLL_INTERVAL_MS}ms, ` +
+        `production ${PRODUCTION_POLL_INTERVAL_MS}ms, ` +
+        `TISS ${TISS_POLL_INTERVAL_MS}ms, ` +
+        `events ${EVENT_POLL_INTERVAL_MS}ms, ` +
+        `max FTP sessions ${MAX_CONCURRENT_FTP}`
+    );
 }
 
+// ====== START ======
 async function start() {
     if (!API_KEY) {
         console.warn("TRACKWEAVING_API_KEY is empty. Set it before production use.");
@@ -827,25 +1311,57 @@ async function start() {
 
     app.listen(HTTP_PORT, healthServerStarted);
 
-    machineRefreshLoop().catch((error) => console.error("Machine refresh loop failed:", error));
-    dataPushLoop().catch((error) => console.error("Data push loop failed:", error));
+    machineRefreshLoop().catch((error) => {
+        console.error("Machine refresh loop failed:", error);
+    });
+
+    dataPushLoop().catch((error) => {
+        console.error("Data push loop failed:", error);
+    });
 }
 
+// ====== SHUTDOWN ======
 function shutdown(signal) {
     console.log(`${signal} received, shutting down...`);
 
     shuttingDown = true;
 
-    for (const control of pollers.values()) control.cancelled = true;
+    for (const control of pollers.values()) {
+        control.cancelled = true;
+    }
 
     setTimeout(() => process.exit(0), 500).unref();
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("unhandledRejection", (reason) => console.error("Unhandled promise rejection:", reason));
-process.on("uncaughtException", (error) => { console.error("Uncaught exception:", error); process.exit(1); });
 
-if (require.main === module) start().catch((error) => { console.error("Reader startup failed:", error); process.exit(1); });
+process.on("unhandledRejection", (reason) => {
+    console.error("Unhandled promise rejection:", reason);
+});
 
-module.exports = { RAW_INDEX, STOP_CODE, parseStatusCsv, parseShiftProductionCsv, parseTissStatusCsv, parseAutoSettingsCsv, parseCurrentShiftEvents, buildStopsData, summarizeStops, processLoomData, resolveLoomNumber };
+process.on("uncaughtException", (error) => {
+    console.error("Uncaught exception:", error);
+    process.exit(1);
+});
+
+if (require.main === module) {
+    start().catch((error) => {
+        console.error("Reader startup failed:", error);
+        process.exit(1);
+    });
+}
+
+module.exports = {
+    RAW_INDEX,
+    STOP_CODE,
+    parseStatusCsv,
+    parseShiftProductionCsv,
+    parseTissStatusCsv,
+    parseAutoSettingsCsv,
+    parseCurrentShiftEvents,
+    buildStopsData,
+    summarizeStops,
+    processLoomData,
+    resolveLoomNumber
+};
