@@ -6,6 +6,8 @@ const https = require("https");
 const { Writable } = require("stream");
 const ftp = require("basic-ftp");
 const moment = require("moment");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 
@@ -38,6 +40,13 @@ const MIN_COUNTED_STOP_SECONDS = toInteger(process.env.MIN_COUNTED_STOP_SECONDS,
 
 const LOOM_UTC_OFFSET = process.env.LOOM_UTC_OFFSET || "+05:30";
 const HTTP_PORT = toInteger(process.env.PORT, 3001);
+const MACHINE_CACHE_FILE = process.env.MACHINE_CACHE_FILE || path.join(path.dirname(process.execPath), "tsudakoma-machine-cache.json");
+const FTP_ERROR_LOG_COOLDOWN_MS = toInteger(process.env.FTP_ERROR_LOG_COOLDOWN_MS, 300000);
+const SLOW_FTP_READ_MS = toInteger(process.env.SLOW_FTP_READ_MS, 5000);
+const SLOW_FTP_QUEUE_MS = toInteger(process.env.SLOW_FTP_QUEUE_MS, 5000);
+const HEALTH_SUMMARY_INTERVAL_MS = toInteger(process.env.HEALTH_SUMMARY_INTERVAL_MS, 300000);
+const APP_STARTED_AT = Date.now();
+const STARTUP_LOG_GRACE_MS = 60000;
 
 const POWER_OFF_STOP_CODE = 9999;
 const UNKNOWN_STOP_CODE = 9998;
@@ -73,6 +82,18 @@ const axiosInstance = axios.create({
 let machineData = {};
 const pollers = new Map();
 let shuttingDown = false;
+let machineApiOffline = false;
+let dataPushOffline = false;
+const healthStats = {
+    ftpReads: 0,
+    ftpReadErrors: 0,
+    totalReadMs: 0,
+    maxReadMs: 0,
+    totalQueueMs: 0,
+    maxQueueMs: 0,
+    slowReads: 0,
+    slowQueues: 0
+};
 
 // ====== HELPERS ======
 function toInteger(value, fallback) {
@@ -149,7 +170,10 @@ function ensureMachineData(machine) {
             lastStartTime: null,
             stop: 0,
             shift: null,
-            isPowerOff: false
+            isPowerOff: false,
+            lastLoggedFtpError: null,
+            lastLoggedFtpErrorAt: null,
+            wasFtpOffline: false
         };
     }
 
@@ -158,6 +182,67 @@ function ensureMachineData(machine) {
     data.stopsData = { ...blankStopsData(), ...(data.stopsData || {}) };
 
     return data;
+}
+
+function saveMachineCache(initData) {
+    try {
+        const payload = JSON.stringify({
+            savedAt: utcNow(),
+            data: initData
+        });
+        const tempFile = MACHINE_CACHE_FILE + ".tmp";
+
+        fs.writeFileSync(tempFile, payload);
+        fs.renameSync(tempFile, MACHINE_CACHE_FILE);
+    } catch (error) {
+        console.error(
+            `[${utcNow()}] Failed to write machine cache:`,
+            error && error.message ? error.message : error
+        );
+    }
+}
+
+function loadMachineCache() {
+    try {
+        if (!fs.existsSync(MACHINE_CACHE_FILE)) {
+            return null;
+        }
+
+        return JSON.parse(fs.readFileSync(MACHINE_CACHE_FILE, "utf8"));
+    } catch (error) {
+        console.warn(
+            `[${utcNow()}] Failed to read machine cache:`,
+            error && error.message ? error.message : error
+        );
+        return null;
+    }
+}
+
+function isExpectedOptionalFileError(error) {
+    const message = error && error.message ? error.message : String(error || "");
+
+    return message.indexOf("550") >= 0 ||
+        /file unavailable/i.test(message) ||
+        /file not found/i.test(message);
+}
+
+function shouldLogFtpError(state, error) {
+    const message = error && error.message ? error.message : String(error || "");
+    const now = Date.now();
+
+    if (message !== state.lastLoggedFtpError) {
+        state.lastLoggedFtpError = message;
+        state.lastLoggedFtpErrorAt = now;
+        return true;
+    }
+
+    if (!state.lastLoggedFtpErrorAt || now - state.lastLoggedFtpErrorAt >= FTP_ERROR_LOG_COOLDOWN_MS) {
+        state.lastLoggedFtpError = message;
+        state.lastLoggedFtpErrorAt = now;
+        return true;
+    }
+
+    return false;
 }
 
 function isTsudakomaMachine(machine) {
@@ -993,6 +1078,7 @@ function markMachinePowerOff(machine, error) {
         applyStopTransition(state, POWER_OFF_STOP_CODE, now);
 
         state.isPowerOff = true;
+        state.wasFtpOffline = true;
         state.currentStopReason = "Power Off";
         state.speed = 0;
 
@@ -1002,6 +1088,10 @@ function markMachinePowerOff(machine, error) {
         }
 
         state.updatedTime = now;
+
+        console.log(
+            `[${now}] Machine offline/power-off: ${machine.ip}, offline=${Math.round(offlineForMs / 1000)}s`
+        );
     }
 }
 
@@ -1055,55 +1145,79 @@ async function pollLoop(machine, control, initialDelayMs) {
 
             backoffMs = POLL_INTERVAL_MS;
 
-            const sourceAgeSeconds = machineData[machineId].lastStatusSourceTimestamp
-                ? Math.max(
-                    0,
-                    moment.utc(fetchedAt).diff(
-                        moment.utc(machineData[machineId].lastStatusSourceTimestamp),
-                        "seconds"
-                    )
-                )
-                : -1;
+            const state = machineData[machineId];
 
-            console.log(
-                `[${fetchedAt}] ${control.machine.ip} L${String(result.loomNo).padStart(3, "0")}`,
-                `stop=${machineData[machineId].stop}`,
-                `rpm=${machineData[machineId].speed}`,
-                `eff=${machineData[machineId].efficiency}`,
-                `meter=${machineData[machineId].productionMeter}`,
-                `queue=${result.queueWaitMs}ms`,
-                `read=${result.readDurationMs}ms`,
-                `sourceAge=${sourceAgeSeconds}s`
-            );
+            healthStats.ftpReads += 1;
+            healthStats.totalReadMs += result.readDurationMs;
+            healthStats.totalQueueMs += result.queueWaitMs;
 
-            if (result.files.shiftProductionError) {
+            if (result.readDurationMs > healthStats.maxReadMs) {
+                healthStats.maxReadMs = result.readDurationMs;
+            }
+
+            if (result.queueWaitMs > healthStats.maxQueueMs) {
+                healthStats.maxQueueMs = result.queueWaitMs;
+            }
+
+            const loomLabel = String(result.loomNo).padStart(3, "0");
+
+            if (state.wasFtpOffline) {
+                console.log(`[${fetchedAt}] FTP recovered: ${control.machine.ip} L${loomLabel}`);
+                state.wasFtpOffline = false;
+                state.lastLoggedFtpError = null;
+                state.lastLoggedFtpErrorAt = null;
+            }
+
+            const startupGraceOver = Date.now() - APP_STARTED_AT >= STARTUP_LOG_GRACE_MS;
+
+            if (startupGraceOver && result.readDurationMs >= SLOW_FTP_READ_MS) {
+                healthStats.slowReads += 1;
+                console.log(
+                    `[${fetchedAt}] Slow FTP read ${control.machine.ip} L${loomLabel} read=${result.readDurationMs}ms queue=${result.queueWaitMs}ms`
+                );
+            }
+
+            if (startupGraceOver && result.queueWaitMs >= SLOW_FTP_QUEUE_MS) {
+                healthStats.slowQueues += 1;
+                console.log(
+                    `[${fetchedAt}] High FTP queue ${control.machine.ip} L${loomLabel} queue=${result.queueWaitMs}ms read=${result.readDurationMs}ms`
+                );
+            }
+
+            if (result.files.shiftProductionError && !isExpectedOptionalFileError(result.files.shiftProductionError)) {
                 console.warn(
                     `[${fetchedAt}] ${control.machine.ip} I_SHIFTPRD.CSV skipped: ${result.files.shiftProductionError}`
                 );
             }
 
-            if (result.files.tissStatusError) {
+            if (result.files.tissStatusError && !isExpectedOptionalFileError(result.files.tissStatusError)) {
                 console.warn(
                     `[${fetchedAt}] ${control.machine.ip} TISS status skipped: ${result.files.tissStatusError}`
                 );
             }
 
-            if (result.files.autoSettingsError) {
+            if (result.files.autoSettingsError && !isExpectedOptionalFileError(result.files.autoSettingsError)) {
                 console.warn(
                     `[${fetchedAt}] ${control.machine.ip} I_AUTO.CSV skipped: ${result.files.autoSettingsError}`
                 );
             }
 
-            if (result.files.shiftEventsError) {
+            if (result.files.shiftEventsError && !isExpectedOptionalFileError(result.files.shiftEventsError)) {
                 console.warn(
                     `[${fetchedAt}] ${control.machine.ip} I_SHIFTEVT.CSV skipped: ${result.files.shiftEventsError}`
                 );
             }
         } catch (error) {
-            console.error(
-                `[${utcNow()}] FTP status read failed for ${control.machine.ip}:`,
-                error && error.message ? error.message : error
-            );
+            const state = ensureMachineData(control.machine);
+            state.wasFtpOffline = true;
+            healthStats.ftpReadErrors += 1;
+
+            if (shouldLogFtpError(state, error)) {
+                console.error(
+                    `[${utcNow()}] FTP read failed for ${control.machine.ip}:`,
+                    error && error.message ? error.message : error
+                );
+            }
 
             markMachinePowerOff(control.machine, error);
 
@@ -1163,44 +1277,72 @@ async function fetchMachines() {
     return response.data && response.data.data ? response.data.data : {};
 }
 
+function applyMachineConfiguration(initData, source) {
+    const serverMachineData = initData.machineData || {};
+
+    for (const [machineId, data] of Object.entries(serverMachineData)) {
+        if (!machineData[machineId]) {
+            machineData[machineId] = data;
+        }
+    }
+
+    const machines = (initData.machines || []).filter(isTsudakomaMachine);
+    const activeIds = new Set(machines.map((machine) => String(machine.id)));
+
+    machines.forEach((machine, index) => {
+        startOrUpdatePoller(machine, index);
+    });
+
+    for (const [id, control] of pollers.entries()) {
+        if (!activeIds.has(id)) {
+            control.cancelled = true;
+            pollers.delete(id);
+        }
+    }
+
+    return machines.length;
+}
+
 async function machineRefreshLoop() {
-    let retryMs = 5000;
+    const cached = loadMachineCache();
+
+    if (cached && cached.data) {
+        const cachedCount = applyMachineConfiguration(cached.data, "local cache");
+        console.log(`[${utcNow()}] Loaded ${cachedCount} Tsudakoma machines from local cache.`);
+    }
+
+    let retryMs = 10000;
+    let loggedTrackWeavingLoad = false;
 
     while (!shuttingDown) {
         try {
             const initData = await fetchMachines();
-            const serverMachineData = initData.machineData || {};
+            const machineCount = applyMachineConfiguration(initData, "TrackWeaving");
+            saveMachineCache(initData);
 
-            for (const [machineId, data] of Object.entries(serverMachineData)) {
-                if (!machineData[machineId]) {
-                    machineData[machineId] = data;
-                }
+            if (machineApiOffline) {
+                console.log(`[${utcNow()}] TrackWeaving machine API connection recovered. machines=${machineCount}`);
+                machineApiOffline = false;
+            } else if (!loggedTrackWeavingLoad) {
+                console.log(`[${utcNow()}] Loaded ${machineCount} Tsudakoma machines from TrackWeaving.`);
             }
 
-            const machines = (initData.machines || []).filter(isTsudakomaMachine);
-            const activeIds = new Set(machines.map((machine) => String(machine.id)));
-
-            machines.forEach((machine, index) => {
-                startOrUpdatePoller(machine, index);
-            });
-
-            for (const [id, control] of pollers.entries()) {
-                if (!activeIds.has(id)) {
-                    control.cancelled = true;
-                    pollers.delete(id);
-                }
-            }
-
-            console.log(`Loaded ${machines.length} Tsudakoma machines from TrackWeaving.`);
-
+            loggedTrackWeavingLoad = true;
             retryMs = MACHINE_REFRESH_MS;
         } catch (error) {
-            console.error(
-                "Error fetching machine list:",
-                error && error.message ? error.message : error
-            );
-
-            retryMs = Math.min(retryMs * 2, 60000);
+            if (!machineApiOffline) {
+                machineApiOffline = true;
+                retryMs = 10000;
+                console.error(
+                    `[${utcNow()}] TrackWeaving machine API unavailable:`,
+                    error && error.message ? error.message : error
+                );
+                console.log(
+                    `[${utcNow()}] Continuing local FTP polling with ${pollers.size} existing machines.`
+                );
+            } else {
+                retryMs = Math.min(retryMs * 2, 60000);
+            }
         }
 
         await sleep(retryMs);
@@ -1250,14 +1392,23 @@ async function dataPushLoop() {
                         machineData[machineId].prevData = null;
                     }
                 }
+
+                if (dataPushOffline) {
+                    console.log(`[${utcNow()}] TrackWeaving data upload recovered.`);
+                    dataPushOffline = false;
+                }
             }
 
             delayMs = DATA_PUSH_INTERVAL_MS;
         } catch (error) {
-            console.error(
-                `[${utcNow()}] Data upload failed:`,
-                error && error.message ? error.message : error
-            );
+            if (!dataPushOffline) {
+                dataPushOffline = true;
+                console.error(
+                    `[${utcNow()}] TrackWeaving data upload unavailable:`,
+                    error && error.message ? error.message : error
+                );
+                console.log(`[${utcNow()}] Local loom polling will continue.`);
+            }
 
             delayMs = Math.min(delayMs * 2, 60000);
         }
@@ -1267,6 +1418,45 @@ async function dataPushLoop() {
 }
 
 // ====== HEALTH ======
+function logHealthSummary() {
+    let powerOff = 0;
+    let readErrors = 0;
+
+    for (const data of Object.values(machineData)) {
+        if (data.isPowerOff) powerOff += 1;
+        if (data.readError) readErrors += 1;
+    }
+
+    const reads = healthStats.ftpReads;
+    const avgRead = reads ? Math.round(healthStats.totalReadMs / reads) : 0;
+    const avgQueue = reads ? Math.round(healthStats.totalQueueMs / reads) : 0;
+
+    console.log(
+        `[${utcNow()}] HEALTH machines=${pollers.size}` +
+        ` powerOff=${powerOff}` +
+        ` readErrors=${readErrors}` +
+        ` reads=${reads}` +
+        ` ftpErrors=${healthStats.ftpReadErrors}` +
+        ` avgRead=${avgRead}ms` +
+        ` maxRead=${healthStats.maxReadMs}ms` +
+        ` avgQueue=${avgQueue}ms` +
+        ` maxQueue=${healthStats.maxQueueMs}ms` +
+        ` slowReads=${healthStats.slowReads}` +
+        ` slowQueues=${healthStats.slowQueues}` +
+        ` machineApi=${machineApiOffline ? "DOWN" : "OK"}` +
+        ` dataApi=${dataPushOffline ? "DOWN" : "OK"}`
+    );
+
+    healthStats.ftpReads = 0;
+    healthStats.ftpReadErrors = 0;
+    healthStats.totalReadMs = 0;
+    healthStats.maxReadMs = 0;
+    healthStats.totalQueueMs = 0;
+    healthStats.maxQueueMs = 0;
+    healthStats.slowReads = 0;
+    healthStats.slowQueues = 0;
+}
+
 function healthHandler(req, res) {
     const machines = Object.entries(machineData).map(([id, data]) => ({
         id,
@@ -1281,6 +1471,8 @@ function healthHandler(req, res) {
         time: utcNow(),
         machineCount: machines.length,
         activePollers: pollers.size,
+        machineApiOnline: !machineApiOffline,
+        dataApiOnline: !dataPushOffline,
         machines
     });
 }
@@ -1310,6 +1502,8 @@ async function start() {
     }
 
     app.listen(HTTP_PORT, healthServerStarted);
+
+    setInterval(logHealthSummary, HEALTH_SUMMARY_INTERVAL_MS).unref();
 
     machineRefreshLoop().catch((error) => {
         console.error("Machine refresh loop failed:", error);
