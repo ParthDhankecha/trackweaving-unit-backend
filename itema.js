@@ -268,6 +268,7 @@ async function readItemaMachine(ip, port = DEFAULT_PORT) {
     await sleep(REQUEST_DELAY);
 
     const principalBuf = await request(ip, port, 18);
+    const warpPatternRaw = principalBuf.subarray(22, 28)?.toString("ascii");
 
     await sleep(REQUEST_DELAY);
 
@@ -285,7 +286,7 @@ async function readItemaMachine(ip, port = DEFAULT_PORT) {
         productionMtr: shift.productionMtr,
         runtime: shift.runtime,
         weftDensity: principal.weftDensity,
-
+        quality: warpPatternRaw,
         stopCategory: live.stopCategory,
         stopDetail: live.stopDetail,
 

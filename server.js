@@ -415,6 +415,7 @@ class ItemaMachineReader {
         state.connected = true;
         state.connectionError = null;
         state.rawData = this.buildRawData(data, currentStopCode);
+        state.quality = data.quality;
     }
 
     buildRawData(data, currentStopCode) {
@@ -439,6 +440,7 @@ class ItemaMachineReader {
             integerOrNull(data.other && data.other.count),
             secondsToMinutes(data.other && data.other.duration),
             integerOrNull(data.speed),
+            data.quality,
         ];
     }
 
