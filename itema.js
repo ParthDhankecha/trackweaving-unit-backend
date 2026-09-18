@@ -4,6 +4,7 @@ const net = require("net");
 
 const DEFAULT_PORT = 12555;
 const SOCKET_TIMEOUT = 4000;
+const REQUEST_DELAY = 500;
 
 
 /* -------------------------------------------------------------------------- */
@@ -45,16 +46,37 @@ function buildPacket(idt) {
 
 function request(ip, port, idt) {
     return new Promise((resolve, reject) => {
-        const socket = net.createConnection({ host: ip, port });
-        const chunks = [];
+        const socket = net.createConnection({host: ip,port});
+
+        let response = Buffer.alloc(0);
         let finished = false;
+
+        socket.setNoDelay(true);
+
+        const cleanup = () => {
+            if (!socket.destroyed) {
+                socket.destroy();
+            }
+        };
 
         const fail = error => {
             if (finished) return;
 
             finished = true;
-            socket.destroy();
+
+            cleanup();
+
             reject(error);
+        };
+
+        const success = data => {
+            if (finished) return;
+
+            finished = true;
+
+            cleanup();
+
+            resolve(data);
         };
 
         socket.on("connect", () => {
@@ -62,22 +84,18 @@ function request(ip, port, idt) {
         });
 
         socket.on("data", chunk => {
-            chunks.push(chunk);
-        });
-
-        socket.on("error", fail);
-
-        socket.on("end", () => {
             if (finished) return;
-            finished = true;
+
+            response = Buffer.concat([response,chunk]);
+
+            /*
+             * Need minimum 10-byte Itema response header.
+             */
+            if (response.length < 10) {
+                return;
+            }
 
             try {
-                const response = Buffer.concat(chunks);
-
-                if (response.length < 10) {
-                    throw new Error(`IDT ${idt}: response too short`);
-                }
-
                 if (response[0] !== 0xff) {
                     throw new Error(`IDT ${idt}: invalid header`);
                 }
@@ -91,22 +109,45 @@ function request(ip, port, idt) {
                     );
                 }
 
-                if (response.length < 10 + dataLength) {
-                    throw new Error(`IDT ${idt}: incomplete response`);
+                const expectedLength =10 + dataLength;
+
+                /*
+                 * TCP response may arrive in multiple chunks.
+                 */
+                if (response.length < expectedLength) {
+                    return;
                 }
 
-                resolve(response.subarray(10, 10 + dataLength));
+                const payload = response.subarray(10, expectedLength);
+
+                /*
+                 * Complete Itema response received.
+                 *
+                 * No need to wait for socket "end".
+                 */
+                success(payload);
+
             } catch (error) {
-                reject(error);
+                fail(error);
             }
         });
 
-        socket.setTimeout(SOCKET_TIMEOUT, () => {
-            fail(new Error(`IDT ${idt}: timeout`));
+        socket.on("error", fail);
+
+        socket.on("end", () => {
+            if (!finished) {
+                fail(new Error(`IDT ${idt}: connection ended before complete response (${response.length} bytes)`));
+            }
         });
+
+        socket.setTimeout(
+            SOCKET_TIMEOUT,
+            () => {
+                fail(new Error(`IDT ${idt}: timeout after ${SOCKET_TIMEOUT}ms, received ${response.length} bytes`));
+            }
+        );
     });
 }
-
 
 /* -------------------------------------------------------------------------- */
 /* IDT 5 - Current Stop                                                       */
@@ -257,8 +298,6 @@ function parseShift(buf) {
 /* -------------------------------------------------------------------------- */
 /* Read Machine                                                               */
 /* -------------------------------------------------------------------------- */
-
-const REQUEST_DELAY = 150;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 

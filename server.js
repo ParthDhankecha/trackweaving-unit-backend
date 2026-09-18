@@ -21,6 +21,8 @@ const CONFIG = {
      * and pushing collected data upstream.
      */
     dataPushIntervalMs: parseInt(process.env.DATA_PUSH_INTERVAL_MS || "7000", 10),
+    itemaPollIntervalMs: parseInt(process.env.ITEMA_POLL_INTERVAL_MS || "10000", 10),
+    itemaMaxConcurrentPolls: parseInt(process.env.ITEMA_MAX_CONCURRENT_POLLS || "5", 10),
     logVariableChanges: process.env.LOG_VARIABLE_CHANGES === "true",
     pendingShiftLogsPath: process.env.PENDING_SHIFT_LOGS_PATH || path.join(process.cwd(), "pending-shift-logs.json"),
 };
@@ -42,6 +44,48 @@ const axiosInstance = axios.create({
 let machineData = {};
 
 const readers = new Map();
+
+let activeItemaPolls = 0;
+
+const itemaPollQueue = [];
+
+function acquireItemaPollSlot() {
+    if (
+        activeItemaPolls <
+        CONFIG.itemaMaxConcurrentPolls
+    ) {
+        activeItemaPolls++;
+
+        return Promise.resolve();
+    }
+
+    return new Promise(resolve => {
+        itemaPollQueue.push(resolve);
+    });
+}
+
+function releaseItemaPollSlot() {
+    if (itemaPollQueue.length > 0) {
+        /*
+         * Existing slot goes directly to the
+         * next waiting machine.
+         *
+         * activeItemaPolls remains unchanged.
+         */
+        const next =
+            itemaPollQueue.shift();
+
+        next();
+
+        return;
+    }
+
+    activeItemaPolls =
+        Math.max(
+            0,
+            activeItemaPolls - 1
+        );
+}
 
 let shuttingDown = false;
 let dataPushTimer = null;
@@ -310,7 +354,7 @@ class ItemaMachineReader {
         initMachineData(this.machine);
 
         const startupDelay = Math.floor(
-            Math.random() * CONFIG.dataPushIntervalMs
+            Math.random() * CONFIG.itemaPollIntervalMs
         );
 
         this.pollTimer = setTimeout(
@@ -320,50 +364,94 @@ class ItemaMachineReader {
     }
 
     async poll() {
-        if (this.destroyed || this.polling) return;
-
+        if (
+            this.destroyed ||
+            this.polling
+        ) {
+            return;
+        }
+    
         this.polling = true;
-
+    
+        let slotAcquired = false;
+    
         try {
-            const data = await readItemaMachine(
-                this.ip,
-                this.port
-            );
-
-            this.lastPayloadAt = new Date().toISOString();
+            /*
+             * Global protection.
+             *
+             * Only X Itema machines may communicate
+             * simultaneously.
+             */
+            await acquireItemaPollSlot();
+    
+            slotAcquired = true;
+    
+            /*
+             * Machine could have been removed while
+             * waiting in the queue.
+             */
+            if (this.destroyed) {
+                return;
+            }
+    
+            const data =
+                await readItemaMachine(
+                    this.ip,
+                    this.port
+                );
+    
+            this.lastPayloadAt =
+                new Date().toISOString();
+    
             this.lastError = null;
-
+    
             if (CONFIG.logVariableChanges) {
                 console.log(
                     `[${this.machineId}] itema=${JSON.stringify(data)}`
                 );
             }
-
+    
             this.processMachineData(data);
-
+    
         } catch (error) {
-            this.lastError = error.message;
-
-            const state = machineData[this.machineId];
-
+    
+            this.lastError =
+                error.message;
+    
+            const state =
+                machineData[this.machineId];
+    
             if (state) {
                 state.connected = false;
-                state.connectionError = error.message;
+    
+                state.connectionError =
+                    error.message;
             }
-
+    
             console.error(
                 `[${this.machineId}] Poll error:`,
                 error.message
             );
-
+    
         } finally {
+    
+            /*
+             * Always return global slot.
+             */
+            if (slotAcquired) {
+                releaseItemaPollSlot();
+            }
+    
             this.polling = false;
-
+    
             if (!this.destroyed) {
-                this.pollTimer = setTimeout(
-                    () => this.poll(),
-                    CONFIG.dataPushIntervalMs
-                );
+    
+                this.pollTimer =
+                    setTimeout(
+                        () => this.poll(),
+    
+                        CONFIG.itemaPollIntervalMs
+                    );
             }
         }
     }
@@ -468,7 +556,7 @@ class ItemaMachineReader {
         this.destroyed = true;
 
         if (this.pollTimer) {
-            clearInterval(this.pollTimer);
+            clearTimeout(this.pollTimer);
 
             this.pollTimer = null;
         }
