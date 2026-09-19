@@ -1,3 +1,5 @@
 trackweaving.exe
 node_modules/
 .DS_Store
+pending-shift-logs.json
+pending-shift-logs.json.tmp
