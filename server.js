@@ -15,7 +15,7 @@ const COUNT = parseInt(process.env.COUNT || "74", 10);
 const ZERO_BASED = true;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "7000", 10);
 
-const workspaceId = "690f350453c8c174cb093c60";
+const workspaceId = "6aae675d246baf82dcf44651";
 const apiKey = "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21";
 const API_BASE_URL = process.env.API_BASE_URL || "https://trackweaving.com/api/v1";
 const PENDING_SHIFT_LOGS_PATH = process.env.PENDING_SHIFT_LOGS_PATH || path.join(process.cwd(), "pending-shift-logs.json");
@@ -375,7 +375,6 @@ async function pollLoop(machine) {
                 }
 
                 const data = resp.data || [];
-                console.log(`Read data from ${ip}:`, data);
 
                 const reg = REGISTER[displayType];
                 if (
@@ -386,7 +385,6 @@ async function pollLoop(machine) {
                 ) {
                     console.log(`Suspicious zero data from ${ip}:`, data);
                 } else {
-                    console.log(`Data from ${ip}:`, data);
                     processData(machine, data);
                 }
 
@@ -448,7 +446,6 @@ setInterval(async () => {
                 delete dataToSend[machineId].prevData;
             }
         }
-        console.log(dataToSend);
         await axios.post(`${API_BASE_URL}/machine-logs`, {
             logs: dataToSend,
             workspaceId,
