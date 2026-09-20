@@ -53,7 +53,7 @@ function request(ip, port, idt) {
 
         socket.setNoDelay(true);
 
-        const cleanup = () => {
+        const destroySocket = () => {
             if (!socket.destroyed) {
                 socket.destroy();
             }
@@ -61,21 +61,27 @@ function request(ip, port, idt) {
 
         const fail = error => {
             if (finished) return;
-
+        
             finished = true;
-
-            cleanup();
-
+        
+            destroySocket();
             reject(error);
         };
-
+        
         const success = data => {
             if (finished) return;
-
+        
             finished = true;
-
-            cleanup();
-
+        
+            /*
+             * We received the complete Itema response.
+             * Close gracefully rather than force-destroying
+             * a successful TCP connection.
+             */
+            if (!socket.destroyed) {
+                socket.end();
+            }
+        
             resolve(data);
         };
 
