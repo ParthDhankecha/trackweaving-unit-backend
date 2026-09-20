@@ -14,6 +14,7 @@ const START_ADDR = parseInt(process.env.START_ADDR || "5000", 10);
 const COUNT = parseInt(process.env.COUNT || "74", 10);
 const ZERO_BASED = true;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "7000", 10);
+const API_TIMEOUT_MS = parseInt(process.env.API_TIMEOUT_MS || "15000", 10);
 
 const workspaceId = "6aae2913246baf82dce97b83";
 const apiKey = "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21";
@@ -42,7 +43,6 @@ const REGISTER = {
 };
 
 let machineData = {};
-let isDataStorAPICalled = false;
 let pendingShiftLogs = [];
 
 // Track all active clients for graceful shutdown
@@ -142,7 +142,7 @@ async function flushPendingShiftLogs() {
         logs: toFlush,
         workspaceId,
         apiKey,
-    });
+    }, { timeout: API_TIMEOUT_MS });
 
     removePendingShiftLogs(toFlush.map((log) => log.id));
     console.log(`Flushed ${toFlush.length} closed shift log(s)`);
@@ -412,7 +412,8 @@ async function initAllMachines() {
         {
             workspaceId,
             apiKey
-        }
+        },
+        { timeout: API_TIMEOUT_MS }
     );
 
     initData = initData.data;
@@ -429,40 +430,39 @@ async function initAllMachines() {
 }
 
 // ====== PERIODIC DATA PUSH ======
-setInterval(async () => {
-    if (isDataStorAPICalled) return;
-
-    try {
-        isDataStorAPICalled = true;
-
-        const dataToSend = {};
-        for (let machineId in machineData) {
-            const m = machineData[machineId];
-            if (
-                m.updatedTime &&
-                moment().diff(moment(m.updatedTime), "hours") < 1
-            ) {
-                dataToSend[machineId] = { ...m };
-                delete dataToSend[machineId].prevData;
-            }
-        }
-        await axios.post(`${API_BASE_URL}/machine-logs`, {
-            logs: dataToSend,
-            workspaceId,
-            apiKey
-        });
-
+async function dataStoreLoop() {
+    while (true) {
         try {
-            await flushPendingShiftLogs();
+            const dataToSend = {};
+            for (let machineId in machineData) {
+                const m = machineData[machineId];
+                if (
+                    m.updatedTime &&
+                    moment().diff(moment(m.updatedTime), "hours") < 1
+                ) {
+                    dataToSend[machineId] = { ...m };
+                    delete dataToSend[machineId].prevData;
+                }
+            }
+
+            await axios.post(`${API_BASE_URL}/machine-logs`, {
+                logs: dataToSend,
+                workspaceId,
+                apiKey
+            }, { timeout: API_TIMEOUT_MS });
+
+            try {
+                await flushPendingShiftLogs();
+            } catch (error) {
+                console.log("Shift log flush error:", error.message || error);
+            }
         } catch (error) {
-            console.log("Shift log flush error:", error.message || error);
+            console.log("Error in data store interval:", error.message || error);
         }
-    } catch (error) {
-        console.log("Error in data store interval:", error.message || error);
-    } finally {
-        isDataStorAPICalled = false;
+
+        await sleep(5000);
     }
-}, 5000);
+}
 
 // ====== EXPRESS SERVER ======
 const PORT = parseInt(process.env.PORT || "3001", 10);
@@ -487,6 +487,9 @@ app.listen(PORT, () => {
     if (pendingShiftLogs.length) {
         console.log(`Pending closed shift logs on disk: ${pendingShiftLogs.length}`);
     }
+    dataStoreLoop().catch((e) => {
+        console.error("dataStoreLoop crashed:", e);
+    });
     initAllMachines().catch((e) => {
         console.error("Failed to init machines:", e);
     });
