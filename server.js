@@ -34,10 +34,10 @@ const MAX_FAILURE_BACKOFF_MS = toInteger(process.env.MAX_FAILURE_BACKOFF_MS, 150
 
 // --- TLM main-computer FTP export (slow, production/report data) ---
 // This is TLMServer.exe on the TLM main PC, serving C:\TSUDA (alias TSUDA per FTP.INI).
-const TLM_SERVER_HOST = process.env.TLM_SERVER_HOST || "";
+const TLM_SERVER_HOST = process.env.TLM_SERVER_HOST || "172.21.0.1";
 const TLM_SERVER_PORT = toInteger(process.env.TLM_SERVER_PORT, 21);
 const TLM_SERVER_USER = process.env.TLM_SERVER_USER || "anonymous";
-const TLM_SERVER_PASSWORD = process.env.TLM_SERVER_PASSWORD || "";
+const TLM_SERVER_PASSWORD = process.env.TLM_SERVER_PASSWORD || "tccs@";
 const TLM_SERVER_SECURE = /^true$/i.test(process.env.TLM_SERVER_SECURE || "false");
 // Adjust if your server's virtual root already lands inside TSUDA (i.e. use "" instead of "/TSUDA").
 const TLM_SERVER_BASE_PATH = process.env.TLM_SERVER_BASE_PATH || "/TSUDA";
