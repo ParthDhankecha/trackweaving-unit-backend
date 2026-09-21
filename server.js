@@ -16,31 +16,45 @@ const API_BASE_URL = process.env.TRACKWEAVING_API_URL || "https://trackweaving.c
 const WORKSPACE_ID = process.env.WORKSPACE_ID || "6a993394e0b2517b5fa0e3d2";
 const API_KEY = process.env.TRACKWEAVING_API_KEY || "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21";
 
+// --- Direct-to-loom FTP (status only, fast) ---
 const FTP_PORT = toInteger(process.env.FTP_PORT, 21);
 const FTP_USERNAME = process.env.FTP_USERNAME || "anonymous";
 const FTP_PASSWORD = process.env.FTP_PASSWORD || "aaatccs@";
 const FTP_SECURE = /^true$/i.test(process.env.FTP_SECURE || "false");
-
 const FTP_TIMEOUT_MS = toInteger(process.env.FTP_TIMEOUT_MS, 7000);
 const FTP_FILE_RETRY_COUNT = toInteger(process.env.FTP_FILE_RETRY_COUNT, 2);
 const FTP_FILE_RETRY_DELAY_MS = toInteger(process.env.FTP_FILE_RETRY_DELAY_MS, 250);
 
-const POLL_INTERVAL_MS = toInteger(process.env.POLL_INTERVAL_MS, 5000);
-const PRODUCTION_POLL_INTERVAL_MS = toInteger(process.env.PRODUCTION_POLL_INTERVAL_MS, 40000);
-const TISS_POLL_INTERVAL_MS = toInteger(process.env.TISS_POLL_INTERVAL_MS, 60000);
-const AUTO_POLL_INTERVAL_MS = toInteger(process.env.AUTO_POLL_INTERVAL_MS, 3600000);
-const EVENT_POLL_INTERVAL_MS = toInteger(process.env.EVENT_POLL_INTERVAL_MS, 300000);
-
-const MACHINE_REFRESH_MS = toInteger(process.env.MACHINE_REFRESH_MS, 300000);
-const DATA_PUSH_INTERVAL_MS = toInteger(process.env.DATA_PUSH_INTERVAL_MS, 5000);
-const POWER_OFF_AFTER_MS = toInteger(process.env.POWER_OFF_AFTER_MS, 90000);
-const MAX_CONCURRENT_FTP = toInteger(process.env.MAX_CONCURRENT_FTP, 16);
+// This is the interval per loom. Kept well under TLM's own ~10-16 min cadence
+// (so stops are caught in time for a 2.5 min highlight) but nowhere near the
+// old 5s/16-concurrent setup that collided with TLM's own polling.
+const STATUS_POLL_INTERVAL_MS = toInteger(process.env.STATUS_POLL_INTERVAL_MS, 100000);
+const MAX_CONCURRENT_FTP = toInteger(process.env.MAX_CONCURRENT_FTP, 8);
 const MAX_FAILURE_BACKOFF_MS = toInteger(process.env.MAX_FAILURE_BACKOFF_MS, 15000);
+
+// --- TLM main-computer FTP export (slow, production/report data) ---
+// This is TLMServer.exe on the TLM main PC, serving C:\TSUDA (alias TSUDA per FTP.INI).
+const TLM_SERVER_HOST = process.env.TLM_SERVER_HOST || "";
+const TLM_SERVER_PORT = toInteger(process.env.TLM_SERVER_PORT, 21);
+const TLM_SERVER_USER = process.env.TLM_SERVER_USER || "anonymous";
+const TLM_SERVER_PASSWORD = process.env.TLM_SERVER_PASSWORD || "";
+const TLM_SERVER_SECURE = /^true$/i.test(process.env.TLM_SERVER_SECURE || "false");
+// Adjust if your server's virtual root already lands inside TSUDA (i.e. use "" instead of "/TSUDA").
+const TLM_SERVER_BASE_PATH = process.env.TLM_SERVER_BASE_PATH || "/TSUDA";
+// TLM itself only refreshes every ~10-16 min, so polling this faster just adds
+// load on the main PC for no benefit. Default is deliberately conservative.
+const TLM_SERVER_POLL_INTERVAL_MS = toInteger(process.env.TLM_SERVER_POLL_INTERVAL_MS, 300000);
+const TLM_SERVER_TIMEOUT_MS = toInteger(process.env.TLM_SERVER_TIMEOUT_MS, 15000);
+
 const MIN_COUNTED_STOP_SECONDS = toInteger(process.env.MIN_COUNTED_STOP_SECONDS, 0);
+const STOP_HIGHLIGHT_SECONDS = toInteger(process.env.STOP_HIGHLIGHT_SECONDS, 150); // 2.5 min
 
 const LOOM_UTC_OFFSET = process.env.LOOM_UTC_OFFSET || "+05:30";
 const HTTP_PORT = toInteger(process.env.PORT, 3001);
 const MACHINE_CACHE_FILE = process.env.MACHINE_CACHE_FILE || path.join(path.dirname(process.execPath), "tsudakoma-machine-cache.json");
+const MACHINE_REFRESH_MS = toInteger(process.env.MACHINE_REFRESH_MS, 300000);
+const DATA_PUSH_INTERVAL_MS = toInteger(process.env.DATA_PUSH_INTERVAL_MS, 5000);
+const POWER_OFF_AFTER_MS = toInteger(process.env.POWER_OFF_AFTER_MS, 90000);
 const FTP_ERROR_LOG_COOLDOWN_MS = toInteger(process.env.FTP_ERROR_LOG_COOLDOWN_MS, 300000);
 const SLOW_FTP_READ_MS = toInteger(process.env.SLOW_FTP_READ_MS, 5000);
 const SLOW_FTP_QUEUE_MS = toInteger(process.env.SLOW_FTP_QUEUE_MS, 5000);
@@ -80,10 +94,20 @@ const axiosInstance = axios.create({
 });
 
 let machineData = {};
+let loomNoToMachineId = new Map();
 const pollers = new Map();
 let shuttingDown = false;
 let machineApiOffline = false;
 let dataPushOffline = false;
+let tlmServerOffline = false;
+
+// Latest snapshot from the TLM main computer, keyed by loom number (integer).
+let tlmServerProductionByLoom = new Map();
+let tlmServerStatusByLoom = new Map();
+let tlmServerShiftDataByLoom = new Map();
+let tlmServerLastFetchedAt = null;
+let pendingClosedShiftLogs = []; // retry queue - not persisted across restarts
+
 const healthStats = {
     ftpReads: 0,
     ftpReadErrors: 0,
@@ -109,15 +133,6 @@ function toNumber(value, fallback) {
 function toSystemShift(rawShift) {
     const shift = toInteger(rawShift);
     return shift > 0 ? shift - 1 : shift;
-}
-
-function round(value, decimals) {
-    if (!Number.isFinite(value)) return 0;
-
-    const decimalPlaces = decimals === undefined ? 1 : decimals;
-    const factor = 10 ** decimalPlaces;
-
-    return Math.round(value * factor) / factor;
 }
 
 function sleep(ms) {
@@ -276,6 +291,13 @@ function resolveLoomNumber(machine) {
     throw new Error(`Cannot resolve Tsudakoma loom number for machine ${machine.id}`);
 }
 
+function ftpCredentials(machine) {
+    return {
+        user: machine.ftpUsername || machine.ftpUser || FTP_USERNAME,
+        password: machine.ftpPassword || FTP_PASSWORD
+    };
+}
+
 // ====== CSV ======
 function parseCsvLine(line) {
     const fields = [];
@@ -311,6 +333,27 @@ function parseCsvRows(text) {
         .split(/\r?\n/)
         .filter((line) => line.length > 0)
         .map(parseCsvLine);
+}
+
+// Generic parser for the TLM-server files that DO have a real header row
+// (Status_*.CSV, Product_Loom.CSV, KIDAIM.CSV, etc). Returns an array of
+// plain objects keyed by the trimmed header names.
+function parseHeaderedCsv(text) {
+    const rows = parseCsvRows(text);
+
+    if (rows.length < 2) return [];
+
+    const headers = rows[0].map((h) => String(h).trim());
+
+    return rows.slice(1).map((row) => {
+        const record = {};
+
+        headers.forEach((header, index) => {
+            record[header] = row[index] !== undefined ? String(row[index]).trim() : "";
+        });
+
+        return record;
+    });
 }
 
 // ====== FTP CONCURRENCY ======
@@ -401,99 +444,7 @@ async function downloadTextWithRetry(client, remotePath) {
     throw lastError;
 }
 
-function ftpCredentials(machine) {
-    return {
-        user: machine.ftpUsername || machine.ftpUser || FTP_USERNAME,
-        password: machine.ftpPassword || FTP_PASSWORD
-    };
-}
-
-// ====== READ LOOM FILES ======
-async function readLoomFiles(machine, options) {
-    async function readFiles() {
-        const client = new ftp.Client(FTP_TIMEOUT_MS);
-        client.prepareTransfer = ftp.enterPassiveModeIPv4;
-        client.ftp.verbose = /^true$/i.test(process.env.FTP_VERBOSE || "false");
-
-        const credentials = ftpCredentials(machine);
-        const loomNo = resolveLoomNumber(machine);
-
-        const readOptions = options && typeof options === "object"
-            ? options
-            : {
-                includeProduction: true,
-                includeTiss: true,
-                includeAuto: true,
-                includeEvents: Boolean(options)
-            };
-
-        const files = {};
-        const startedAt = Date.now();
-
-        try {
-            await client.access({
-                host: machine.ip,
-                port: toInteger(machine.ftpPort, FTP_PORT),
-                user: credentials.user,
-                password: credentials.password,
-                secure: FTP_SECURE
-            });
-
-            // Live status is mandatory.
-            files.status = await downloadTextWithRetry(client, "I_STATUS.CSV");
-
-            if (readOptions.includeProduction) {
-                try {
-                    files.shiftProduction = await downloadTextWithRetry(client, "I_SHIFTPRD.CSV");
-                } catch (error) {
-                    files.shiftProductionError = error && error.message ? error.message : String(error);
-                }
-            }
-
-            if (readOptions.includeTiss) {
-                try {
-                    files.tissStatus = await downloadTextWithRetry(client, `${loomNo}_I_TISS_STATUS.CSV`);
-                } catch (error) {
-                    files.tissStatusError = error && error.message ? error.message : String(error);
-                }
-            }
-
-            if (readOptions.includeAuto) {
-                try {
-                    files.autoSettings = await downloadTextWithRetry(client, "I_AUTO.CSV");
-                    files.autoSettingsError = null;
-                } catch (error) {
-                    files.autoSettingsError = error && error.message ? error.message : String(error);
-                }
-            }
-
-            if (readOptions.includeEvents) {
-                try {
-                    files.shiftEvents = await downloadTextWithRetry(client, "I_SHIFTEVT.CSV");
-                } catch (error) {
-                    files.shiftEventsError = error && error.message ? error.message : String(error);
-                }
-            }
-
-            return {
-                files,
-                loomNo,
-                readDurationMs: Date.now() - startedAt
-            };
-        } finally {
-            client.close();
-        }
-    }
-
-    const queueStartedAt = Date.now();
-    const result = await ftpSemaphore.use(readFiles);
-
-    result.queueWaitMs = Math.max(0, Date.now() - queueStartedAt - result.readDurationMs);
-
-    return result;
-}
-
-// ====== PARSERS ======
+// ====== DIRECT-TO-LOOM: STATUS ONLY (fast, 90s) ======
 function parseStatusCsv(text) {
     const rows = parseCsvRows(text);
 
@@ -533,83 +484,52 @@ function parseStatusCsv(text) {
     };
 }
 
-function parseShiftProductionCsv(text) {
-    const rows = parseCsvRows(text);
+function round(value, decimals) {
+    if (!Number.isFinite(value)) return 0;
 
-    if (!rows.length) throw new Error("I_SHIFTPRD.CSV is empty");
+    const decimalPlaces = decimals === undefined ? 1 : decimals;
+    const factor = 10 ** decimalPlaces;
 
-    const row = rows[rows.length - 1];
-
-    if (row.length < 20) throw new Error("I_SHIFTPRD.CSV current row is incomplete");
-
-    const rpm = toNumber(row[6]);
-    const elapsedMinutes = toNumber(row[7]) / 10;
-    const availableMinutes = toNumber(row[8]) / 10;
-    const runtimeMinutes = toNumber(row[8]) / 10;
-    const productionMeter = toNumber(row[10]) / 10;
-    const unavailableMinutes = toNumber(row[11]) / 10;
-    const totalStopCount = toInteger(row[15]);
-
-    const millEfficiency = elapsedMinutes > 0
-        ? (availableMinutes / elapsedMinutes) * 100
-        : toNumber(row[19]) / 10;
-
-    const loomEfficiency = toNumber(row[19]) / 10;
-    const calculatedShiftPicks = Math.max(0, Math.round(toNumber(row[9]) * 100));
-
-    return {
-        shiftDate: String(row[0]).trim(),
-        shift: toSystemShift(row[1]),
-        sourceDate: String(row[3]).trim(),
-        sourceTime: String(row[4]).trim(),
-        sourceTimestamp: loomDateTimeToUtc(row[3], row[4]),
-        styleNo: String(row[5] || "").trim(),
-        rpm,
-        elapsedMinutes: round(elapsedMinutes, 1),
-        availableMinutes: round(availableMinutes, 1),
-        runtimeMinutes: round(runtimeMinutes, 1),
-        productionMeter: round(productionMeter, 1),
-        unavailableMinutes: round(unavailableMinutes, 1),
-        millEfficiency: round(millEfficiency, 1),
-        loomEfficiency: round(loomEfficiency, 1),
-        calculatedShiftPicks,
-        totalStopCount,
-        raw: row
-    };
+    return Math.round(value * factor) / factor;
 }
 
-function parseTissStatusCsv(text) {
-    if (!text) return null;
+async function readLoomStatus(machine) {
+    async function doRead() {
+        const client = new ftp.Client(FTP_TIMEOUT_MS);
+        client.prepareTransfer = ftp.enterPassiveModeIPv4;
+        client.ftp.verbose = /^true$/i.test(process.env.FTP_VERBOSE || "false");
 
-    const rows = parseCsvRows(text);
+        const credentials = ftpCredentials(machine);
+        const loomNo = resolveLoomNumber(machine);
+        const startedAt = Date.now();
 
-    if (!rows.length || rows[0].length < 16) return null;
+        try {
+            await client.access({
+                host: machine.ip,
+                port: toInteger(machine.ftpPort, FTP_PORT),
+                user: credentials.user,
+                password: credentials.password,
+                secure: FTP_SECURE
+            });
 
-    const row = rows[0];
+            const statusText = await downloadTextWithRetry(client, "I_STATUS.CSV");
 
-    return {
-        sourceDate: String(row[0]).trim(),
-        sourceTime: String(row[1]).trim(),
-        sourceTimestamp: loomDateTimeToUtc(row[0], row[1]),
-        assumedCurrentOrSetRpm: toNumber(row[5]) / 10,
-        assumedWeftDensity: toNumber(row[15]) / 10,
-        raw: row
-    };
-}
+            return {
+                status: parseStatusCsv(statusText),
+                loomNo,
+                readDurationMs: Date.now() - startedAt
+            };
+        } finally {
+            client.close();
+        }
+    }
 
-function parseAutoSettingsCsv(text) {
-    if (!text) return null;
+    const queueStartedAt = Date.now();
+    const result = await ftpSemaphore.use(doRead);
 
-    const rows = parseCsvRows(text);
+    result.queueWaitMs = Math.max(0, Date.now() - queueStartedAt - result.readDurationMs);
 
-    if (rows.length <= 2732) return null;
-
-    const densityRaw = toNumber(rows[2732][0]);
-
-    return {
-        densityRaw,
-        weftDensity: densityRaw / 10
-    };
+    return result;
 }
 
 // ====== STOP CODES ======
@@ -619,13 +539,13 @@ const STOP_CODE = Object.freeze({
     25: { reason: "H2 feeler C1", bucket: "h2", group: "filling" },
     26: { reason: "H2 feeler C2", bucket: "h2", group: "filling" },
     31: { reason: "Dropper", bucket: "warp", group: "warp" },
-    41: { reason: "Leno left", bucket: "other", group: "other" },
-    42: { reason: "Leno right", bucket: "other", group: "other" },
+    41: { reason: "Leno left", bucket: "warp", group: "warp" },
+    42: { reason: "Leno right", bucket: "warp", group: "warp" },
     43: { reason: "CC", bucket: "warp", group: "warp" },
-    50: { reason: "Package sensor C1", bucket: "h1", group: "h1" },
-    51: { reason: "Package sensor C2", bucket: "h1", group: "h1" },
+    50: { reason: "Package sensor C1", bucket: "other", group: "other" },
+    51: { reason: "Package sensor C2", bucket: "other", group: "other" },
     71: { reason: "Counter", bucket: "other", group: "other" },
-    11: { reason: "Stop button", bucket: "manual", group: "other" }
+    11: { reason: "Stop button", bucket: "other", group: "other" }
 });
 
 function stopDefinition(code) {
@@ -636,106 +556,11 @@ function stopDefinition(code) {
     };
 }
 
-// ====== EVENTS ======
-function parseCurrentShiftEvents(text) {
-    if (!text) return null;
-
-    const rows = parseCsvRows(text);
-
-    if (!rows.length) return null;
-
-    const row = rows[rows.length - 1];
-    const shiftDate = String(row[0]).trim();
-    const shift = toSystemShift(row[1]);
-    const events = [];
-
-    for (let index = 5; index + 10 < row.length; index += 11) {
-        const group = row.slice(index, index + 11);
-        const code = toInteger(group[4]);
-
-        if (code <= 0) continue;
-
-        const start = loomDateTimeToUtc(group[0], group[1]);
-        const durationSeconds = Math.max(0, Math.round(toNumber(group[8]) * 6));
-
-        if (!start || durationSeconds < MIN_COUNTED_STOP_SECONDS) continue;
-
-        const definition = stopDefinition(code);
-
-        events.push({
-            start,
-            end: moment.utc(start).add(durationSeconds, "seconds").format(),
-            statusCode: code,
-            duration: durationSeconds,
-            reason: definition.reason,
-            group: definition.group,
-            bucket: definition.bucket,
-            doffNo: toInteger(group[2]),
-            clothLengthMeter: toNumber(group[3]) / 10,
-            eventKey: `${start}|${code}|${group[2]}|${group[3]}`
-        });
-    }
-
-    return { shiftDate, shift, events, raw: row };
-}
-
-function buildStopsData(events) {
-    const stopsData = blankStopsData();
-
-    for (const event of events) {
-        const bucket = stopsData[event.bucket] ? event.bucket : "other";
-
-        stopsData[bucket].push({
-            start: event.start,
-            end: event.end,
-            statusCode: event.statusCode,
-            duration: event.duration,
-            reason: event.reason,
-            doffNo: event.doffNo,
-            clothLengthMeter: event.clothLengthMeter
-        });
-    }
-
-    return stopsData;
-}
-
-function summarizeStops(events) {
-    const summary = {
-        total: { count: 0, durationSeconds: 0 },
-        filling: { count: 0, durationSeconds: 0 },
-        warp: { count: 0, durationSeconds: 0 },
-        other: { count: 0, durationSeconds: 0 },
-        byCode: {}
-    };
-
-    for (const event of events) {
-        summary.total.count += 1;
-        summary.total.durationSeconds += event.duration;
-
-        const group = summary[event.group] ? event.group : "other";
-
-        summary[group].count += 1;
-        summary[group].durationSeconds += event.duration;
-
-        const key = String(event.statusCode);
-
-        if (!summary.byCode[key]) {
-            summary.byCode[key] = {
-                code: event.statusCode,
-                reason: event.reason,
-                count: 0,
-                durationSeconds: 0
-            };
-        }
-
-        summary.byCode[key].count += 1;
-        summary.byCode[key].durationSeconds += event.duration;
-    }
-
-    return summary;
-}
-
-// ====== STOP PROCESSING ======
+// ====== LIVE STOP TRACKING (derived purely from the 90s status polls) ======
+// We no longer pull I_SHIFTEVT.CSV per loom, so this live transition tracking
+// is now the ONLY source of stop start/end/duration. Resolution is bounded by
+// STATUS_POLL_INTERVAL_MS - a stop's recorded start can lag its real start by
+// up to that interval.
 function closeLiveStop(machineState, endTime) {
     if (!machineState.lastStopTime || !machineState.stop) return;
 
@@ -759,6 +584,7 @@ function closeLiveStop(machineState, endTime) {
     });
 
     machineState.stopCount += 1;
+    machineState.totalStopCount += 1;
 }
 
 function applyStopTransition(machineState, newStop, eventTimestamp) {
@@ -779,228 +605,465 @@ function applyStopTransition(machineState, newStop, eventTimestamp) {
     machineState.stop = newStop;
 }
 
-function aggregateStopBucket(stopsData, bucketNames) {
-    const entries = bucketNames.flatMap((name) => stopsData[name] || []);
-    const durationSeconds = entries.reduce((total, entry) => total + (entry.duration || 0), 0);
+function stoppedForSeconds(state, nowIso) {
+    if (!state.stop || !state.lastStopTime) return 0;
+
+    return Math.max(0, moment.utc(nowIso).diff(moment.utc(state.lastStopTime), "seconds"));
+}
+
+// ====== TLM MAIN-SERVER FTP READER (slow, production data) ======
+// Reads TLMServer.exe's export of C:\TSUDA on the TLM main computer.
+// Confirmed-good sources (real header rows, verified against sample data):
+//   TLM/Status/Status_*.CSV      - one row per loom, all-machine snapshot
+//   TLM/Product-Data/Product_Loom.CSV - per-loom style/lot production baselines
+//
+// NOT wired up here: Day-Data / Week-Data / Month-Data / Event-Data / Shift-Data.
+// Those files have no header row - columns are positional and we have not
+// verified their layout. Wiring efficiency/RPM/picks history from them without
+// confirming against the bundled Excel templates (TLM\Program\Excel\*.xls) would
+// mean silently showing wrong numbers, so they're deliberately left out for now.
+async function fetchTlmServerFile(client, remotePath) {
+    return downloadTextWithRetry(client, remotePath);
+}
+
+async function findLatestFile(client, dirPath, pattern) {
+    const list = await client.list(dirPath);
+    const matches = list
+        .filter((item) => item.isFile && pattern.test(item.name))
+        .map((item) => item.name)
+        .sort();
+
+    return matches.length ? matches[matches.length - 1] : null;
+}
+
+function parseTlmServerStatusRow(row) {
+    // Header (verified from a real export):
+    // LoomNo,CurrDate,CurrTime,Run/Stop,Status,StopCode,CtlHost/Loom,TRBSW,APRSW,
+    // FeelerSW,H1TRB,SensorSW,CntSW,RTCbatER,FixCall,DoffCall,TRBCode,Dia(R),Dia(L),
+    // DoffNo,ClothCutLng,ClothRunTm,ClothPicks,ClothLng,ClothUnit,BeamSlashLng,
+    // BeamRunTime,BeamLng,BeamUnit,Status(T),ClothRemainMin,BeamRemainHour(T),
+    // BeamRemainHour(B),BeamSlash(T)
+    const loomNo = Number.parseInt(String(row.LoomNo || "").replace(/^L/i, ""), 10);
 
     return {
-        count: entries.length,
-        durationSeconds
+        loomNo,
+        sourceDate: row.CurrDate,
+        sourceTime: row.CurrTime,
+        sourceTimestamp: loomDateTimeToUtc(row.CurrDate, row.CurrTime),
+        runFlag: toInteger(row["Run/Stop"]),
+        stopCode: toInteger(row.StopCode),
+        doffNo: toInteger(row.DoffNo),
+        clothRemainingMinutes: toNumber(row.ClothRemainMin) / 10,
+        beamRemainingHoursTop: toNumber(row["BeamRemainHour(T)"]),
+        beamRemainingHoursBottom: toNumber(row["BeamRemainHour(B)"]),
+        raw: row
     };
 }
 
-function buildNormalizedRawData(values, stopsData) {
-    const data = Array(Object.keys(RAW_INDEX).length).fill(0);
+// TLM/Shift-Data/L0xx_<timestamp>.CSV - one row per shift, oldest first.
+// The LAST row is always the current in-progress shift. When a shift closes,
+// TLM finalizes that row (round shift-end time, elapsed=~720) and appends a
+// NEW last row for the next shift - that row-count growth is how we detect
+// a closed shift (see detectClosedShifts below), not a wall-clock guess.
+//
+// All columns below are verified against real TLM report output
+// (Term_report.xls "Report by term" tab, cross-checked field by field):
+//   0-3   shift start/end date+time, shift number
+//   4     rpm
+//   5     elapsedMinutes x10        (TLM calls this "monitored time")
+//   6     runtimeMinutes x10        (= elapsed - totalStopMinutes)
+//   9-11  total/filling/warp stop MINUTES x10 (aggregates; filling = h1+h2)
+//   12-14 total/filling/warp stop COUNTS
+//   15-22 H1 feeler C1-C8 counts       45-52 H1 feeler C1-C8 durations x10
+//   23-30 H2 feeler C1-C8 counts       53-60 H2 feeler C1-C8 durations x10
+//   31-34 Dropper/LenoL/LenoR/CC counts 61-64 same, durations x10
+//   35-42 Package sensor C1-C8 counts  65-72 same, durations x10
+//   43-44 Counter/StopButton counts    73-74 same, durations x10
+//
+// efficiencyPercent = runtime/elapsed*100. Per the manual (B704-5, Note 1),
+// this is the formula for BOTH Mill and Loom efficiency; they only differ
+// when a loom loses power mid-shift, which we have no confirmed column for
+// yet, so this one formula is used for both.
+const SHIFT_DATA_INDEX = Object.freeze({
+    shiftStartDate: 0,
+    shift: 1,
+    shiftEndDate: 2,
+    shiftEndTime: 3,
+    rpm: 4,
+    elapsedMinutesX10: 5,
+    runtimeMinutesX10: 6,
+    picksX100: 7,          // manual item 8: "Woven cloth pick number [100 picks]"
+    clothLengthX10: 8,     // manual item 9: "Woven cloth length [0.1 m]"
+    totalStopMinutesX10: 9,
+    totalStopCount: 12
+});
 
-    const warp = aggregateStopBucket(stopsData, ["warp"]);
-    const h1 = aggregateStopBucket(stopsData, ["h1"]);
-    const h2 = aggregateStopBucket(stopsData, ["h2", "feeder"]);
-    const other = aggregateStopBucket(stopsData, ["other", "manual"]);
-
-    data[RAW_INDEX.shift] = values.shift;
-    data[RAW_INDEX.quality] = values.quality;
-    data[RAW_INDEX.stopCode] = values.currentStop;
-    data[RAW_INDEX.runTime] = values.runtimeMinutes;
-    data[RAW_INDEX.efficiencyPercent] = values.loomEfficiency;
-    data[RAW_INDEX.currentDensity] = values.weftDensity;
-    data[RAW_INDEX.pieceLengthM] = values.productionMeter;
-    data[RAW_INDEX.picksCurrentShift] = values.currentShiftPicks;
-    data[RAW_INDEX.beamLeft] = values.beamLeftMeter;
-    data[RAW_INDEX.initialBeamLeft] = values.beamOriginalMeter;
-    data[RAW_INDEX.beamCompletionDate] = values.beamCompletionDatetime;
-    data[RAW_INDEX.warpStopCount] = warp.count;
-    data[RAW_INDEX.warpStopDuration] = warp.durationSeconds / 60;
-    data[RAW_INDEX.h1StopCount] = h1.count;
-    data[RAW_INDEX.h1StopDuration] = h1.durationSeconds / 60;
-    data[RAW_INDEX.h2StopCount] = h2.count;
-    data[RAW_INDEX.h2StopDuration] = h2.durationSeconds / 60;
-    data[RAW_INDEX.otherStopCount] = other.count;
-    data[RAW_INDEX.otherStopDuration] = other.durationSeconds / 60;
-    data[RAW_INDEX.speedRpm] = values.currentRpm;
-
-    return data;
+function sumRange(row, start, end) {
+    let total = 0;
+    for (let i = start; i <= end; i += 1) {
+        total += toNumber(row[i]);
+    }
+    return total;
 }
 
-// ====== MACHINE PROCESSING ======
-function processLoomData(machine, result, fetchedAt) {
+function parseShiftDataRow(row) {
+    const elapsedMinutes = toNumber(row[SHIFT_DATA_INDEX.elapsedMinutesX10]) / 10;
+    const runtimeMinutes = toNumber(row[SHIFT_DATA_INDEX.runtimeMinutesX10]) / 10;
+
+    const efficiencyPercent = elapsedMinutes > 0
+        ? round((runtimeMinutes / elapsedMinutes) * 100, 1)
+        : 0;
+
+    const stopBreakdown = {
+        h1: {
+            count: sumRange(row, 15, 22),
+            duration: round(sumRange(row, 45, 52) / 10, 1)
+        },
+        h2: {
+            count: sumRange(row, 23, 30),
+            duration: round(sumRange(row, 53, 60) / 10, 1)
+        },
+        // Dropper, Leno-left, Leno-right, CC - matches TLM's own "Warp stop" grouping
+        warp: {
+            count: sumRange(row, 31, 34),
+            duration: round(sumRange(row, 61, 64) / 10, 1)
+        },
+        // Package sensor x8 + Counter + Stop button
+        other: {
+            count: sumRange(row, 35, 44),
+            duration: round(sumRange(row, 65, 74) / 10, 1)
+        }
+    };
+
+    return {
+        shiftStartDate: String(row[SHIFT_DATA_INDEX.shiftStartDate] || "").trim(),
+        shift: toInteger(row[SHIFT_DATA_INDEX.shift]),
+        shiftEndDate: String(row[SHIFT_DATA_INDEX.shiftEndDate] || "").trim(),
+        shiftEndTime: String(row[SHIFT_DATA_INDEX.shiftEndTime] || "").trim(),
+        rpm: toNumber(row[SHIFT_DATA_INDEX.rpm]),
+        elapsedMinutes: round(elapsedMinutes, 1),
+        runtimeMinutes: round(runtimeMinutes, 1),
+        efficiencyPercent,
+        picks: toNumber(row[SHIFT_DATA_INDEX.picksX100]) * 100, // manual: units of 100 picks
+        clothLengthMeter: round(toNumber(row[SHIFT_DATA_INDEX.clothLengthX10]) / 10, 1),
+        totalStopMinutes: round(toNumber(row[SHIFT_DATA_INDEX.totalStopMinutesX10]) / 10, 1),
+        totalStopCount: toInteger(row[SHIFT_DATA_INDEX.totalStopCount]),
+        stopBreakdown,
+        raw: row
+    };
+}
+
+function parseTlmServerProductLoomRow(row) {
+    // Header (verified from a real export):
+    // LoomNo,StyleNo,S_YYYYMMDD,S_Shift,S_0.1m,S_Picks,S_Pieces,LotNo,
+    // L_YYYYMMDD,L_Shift,L_0.1m,L_Picks,L_Pieces,S_0.01m,L_0.01m
+    // S_ fields = counter baseline at style start, L_ fields = counter baseline
+    // at lot start. These are NOT live shift efficiency/RPM figures.
+    const loomNo = Number.parseInt(String(row.LoomNo || "").replace(/^L/i, ""), 10);
+
+    return {
+        loomNo,
+        styleNo: (row.StyleNo || "").trim(),
+        lotNo: (row.LotNo || "").trim(),
+        styleStartDate: row.S_YYYYMMDD,
+        styleStartShift: toInteger(row.S_Shift),
+        styleStartMeter: toNumber(row["S_0.1m"]) / 10,
+        styleStartPicks: toNumber(row.S_Picks),
+        styleStartPieces: toNumber(row.S_Pieces),
+        lotStartDate: row.L_YYYYMMDD,
+        lotStartShift: toInteger(row.L_Shift),
+        lotStartMeter: toNumber(row["L_0.1m"]) / 10,
+        lotStartPicks: toNumber(row.L_Picks),
+        lotStartPieces: toNumber(row.L_Pieces),
+        raw: row
+    };
+}
+
+async function readTlmServerSnapshot() {
+    if (!TLM_SERVER_HOST) {
+        throw new Error("TLM_SERVER_HOST is not configured");
+    }
+
+    const client = new ftp.Client(TLM_SERVER_TIMEOUT_MS);
+    client.prepareTransfer = ftp.enterPassiveModeIPv4;
+    client.ftp.verbose = /^true$/i.test(process.env.FTP_VERBOSE || "false");
+
+    const statusByLoom = new Map();
+    const productionByLoom = new Map();
+    const shiftDataByLoom = new Map();
+
+    try {
+        await client.access({
+            host: TLM_SERVER_HOST,
+            port: TLM_SERVER_PORT,
+            user: TLM_SERVER_USER,
+            password: TLM_SERVER_PASSWORD,
+            secure: TLM_SERVER_SECURE
+        });
+
+        const statusDir = `${TLM_SERVER_BASE_PATH}/TLM/Status`;
+        const latestStatusFile = await findLatestFile(client, statusDir, /^Status_\d+\.CSV$/i);
+
+        if (latestStatusFile) {
+            const text = await fetchTlmServerFile(client, `${statusDir}/${latestStatusFile}`);
+
+            for (const row of parseHeaderedCsv(text)) {
+                const parsed = parseTlmServerStatusRow(row);
+                if (Number.isFinite(parsed.loomNo)) {
+                    statusByLoom.set(parsed.loomNo, parsed);
+                }
+            }
+        } else {
+            console.warn(`[${utcNow()}] TLM server: no Status_*.CSV found in ${statusDir}`);
+        }
+
+        const productLoomPath = `${TLM_SERVER_BASE_PATH}/TLM/Product-Data/Product_Loom.CSV`;
+        const productText = await fetchTlmServerFile(client, productLoomPath);
+
+        for (const row of parseHeaderedCsv(productText)) {
+            const parsed = parseTlmServerProductLoomRow(row);
+            if (Number.isFinite(parsed.loomNo)) {
+                productionByLoom.set(parsed.loomNo, parsed);
+            }
+        }
+
+        // Shift-Data: one file per loom, filename carries a timestamp, so we
+        // list the directory once and match "L0xx_..." per loom rather than
+        // guessing the current filename.
+        const shiftDataDir = `${TLM_SERVER_BASE_PATH}/TLM/Shift-Data`;
+        const shiftDataFiles = await client.list(shiftDataDir);
+        const shiftDataByLoomNo = new Map();
+
+        for (const item of shiftDataFiles) {
+            const match = item.isFile && item.name.match(/^L(\d{3})_\d+\.CSV$/i);
+            if (match) {
+                shiftDataByLoomNo.set(Number.parseInt(match[1], 10), item.name);
+            }
+        }
+
+        for (const [loomNo, fileName] of shiftDataByLoomNo.entries()) {
+            try {
+                const text = await fetchTlmServerFile(client, `${shiftDataDir}/${fileName}`);
+                const rows = parseCsvRows(text);
+
+                if (rows.length) {
+                    // Keep ALL parsed rows (not just the last) - row-count
+                    // growth between refreshes is how we detect a shift close.
+                    shiftDataByLoom.set(loomNo, rows.map(parseShiftDataRow));
+                }
+            } catch (error) {
+                console.warn(
+                    `[${utcNow()}] TLM server: could not read Shift-Data for L${String(loomNo).padStart(3, "0")}: ${error.message}`
+                );
+            }
+        }
+
+        return { statusByLoom, productionByLoom, shiftDataByLoom };
+    } finally {
+        client.close();
+    }
+}
+
+async function tlmServerRefreshLoop() {
+    if (!TLM_SERVER_HOST) {
+        console.warn(
+            `[${utcNow()}] TLM_SERVER_HOST is not set - skipping TLM main-server production reader.`
+        );
+        return;
+    }
+
+    while (!shuttingDown) {
+        try {
+            const snapshot = await readTlmServerSnapshot();
+
+            tlmServerStatusByLoom = snapshot.statusByLoom;
+            tlmServerProductionByLoom = snapshot.productionByLoom;
+            tlmServerShiftDataByLoom = snapshot.shiftDataByLoom;
+            tlmServerLastFetchedAt = utcNow();
+
+            applyTlmServerDataToMachines();
+
+            if (tlmServerOffline) {
+                console.log(`[${tlmServerLastFetchedAt}] TLM main-server FTP recovered.`);
+                tlmServerOffline = false;
+            }
+        } catch (error) {
+            if (!tlmServerOffline) {
+                tlmServerOffline = true;
+                console.error(
+                    `[${utcNow()}] TLM main-server FTP read failed:`,
+                    error && error.message ? error.message : error
+                );
+            }
+        }
+
+        await sleep(TLM_SERVER_POLL_INTERVAL_MS);
+    }
+}
+
+function applyTlmServerDataToMachines() {
+    const closedShiftLogs = [];
+
+    for (const [loomNo, machineId] of loomNoToMachineId.entries()) {
+        const state = machineData[machineId];
+        if (!state) continue;
+
+        const production = tlmServerProductionByLoom.get(loomNo);
+
+        if (production) {
+            state.styleNo = production.styleNo || state.styleNo;
+            state.lotNo = production.lotNo;
+            state.lotStartMeter = production.lotStartMeter;
+            state.lotStartPicks = production.lotStartPicks;
+            state.lotStartPieces = production.lotStartPieces;
+            state.styleStartMeter = production.styleStartMeter;
+            state.styleStartPicks = production.styleStartPicks;
+        }
+
+        const shiftRows = tlmServerShiftDataByLoom.get(loomNo);
+
+        if (shiftRows && shiftRows.length) {
+            const previousRowCount = Number.isInteger(state.shiftDataRowCount)
+                ? state.shiftDataRowCount
+                : shiftRows.length; // first sighting of this loom: nothing to close yet, just baseline
+
+            if (shiftRows.length > previousRowCount) {
+                // One or more shifts finalized since our last check. Every row
+                // from the old "last" index up to (but not including) the new
+                // last row is now guaranteed-final.
+                for (let i = previousRowCount - 1; i < shiftRows.length - 1; i += 1) {
+                    closedShiftLogs.push(buildClosedShiftLog(machineOf(machineId, state), state, shiftRows[i]));
+                }
+
+                // Reset live per-shift tracking for the new in-progress shift.
+                state.stopsData = blankStopsData();
+                state.stopCount = 0;
+                state.totalStopCount = 0;
+                state.lastStartTime = null;
+                // Deliberately NOT clearing lastStopTime/stop: if the loom is
+                // stopped right through the boundary, stoppedForSeconds must
+                // keep counting through the shift change.
+            }
+
+            state.shiftDataRowCount = shiftRows.length;
+
+            const currentShiftRow = shiftRows[shiftRows.length - 1];
+
+            state.shift = toSystemShift(currentShiftRow.shift);
+            state.averageRpm = currentShiftRow.rpm;
+            state.elapsedMinutes = currentShiftRow.elapsedMinutes;
+            state.runtimeMinutes = currentShiftRow.runtimeMinutes;
+            state.efficiency = currentShiftRow.efficiencyPercent;
+            state.currentShiftPicksFromTlm = currentShiftRow.picks; // manual-confirmed, refreshes ~5 min
+            state.currentShiftClothLength = currentShiftRow.clothLengthMeter;
+            state.stopBreakdown = currentShiftRow.stopBreakdown; // {warp,h1,h2,other}: {count,duration}
+        }
+
+        state.tlmServerLastSyncAt = tlmServerLastFetchedAt;
+    }
+
+    if (closedShiftLogs.length) {
+        sendClosedShiftLogs(closedShiftLogs);
+    }
+}
+
+// machineData is keyed by id only; the actual machine record (ip, displayType
+// etc.) lives on the poller control.
+function machineOf(machineId, state) {
+    const control = pollers.get(machineId);
+    return control ? control.machine : { id: machineId, displayType: state.displayType };
+}
+
+function buildClosedShiftLog(machine, state, closedRow) {
+    const breakdown = closedRow.stopBreakdown;
+
+    const stopsData = {
+        ...blankStopsData(),
+        warp: [{ count: breakdown.warp.count, duration: breakdown.warp.duration * 60, reason: "Warp (TLM shift total)" }],
+        h1: [{ count: breakdown.h1.count, duration: breakdown.h1.duration * 60, reason: "H1 feeler (TLM shift total)" }],
+        h2: [{ count: breakdown.h2.count, duration: breakdown.h2.duration * 60, reason: "H2 feeler (TLM shift total)" }],
+        other: [{ count: breakdown.other.count, duration: breakdown.other.duration * 60, reason: "Other (TLM shift total)" }]
+    };
+
+    const rawData = [
+        toSystemShift(closedRow.shift),
+        state.styleNo || "",
+        0, // stopCode - shift is closed, no "current" stop to report
+        closedRow.runtimeMinutes,
+        closedRow.efficiencyPercent,
+        0, // currentDensity - out of scope for now
+        state.currentPieceMeter || 0,
+        state.currentShiftPicks || 0,
+        state.beamLeftMeter || 0,
+        state.beamOriginalMeter || 0,
+        state.beamCompletionDatetime || null,
+        breakdown.warp.count,
+        breakdown.warp.duration,
+        breakdown.h1.count,
+        breakdown.h1.duration,
+        breakdown.h2.count,
+        breakdown.h2.duration,
+        breakdown.other.count,
+        breakdown.other.duration,
+        closedRow.rpm
+    ];
+
+    return {
+        machineId: String(machine.id),
+        displayType: state.displayType,
+        shift: toSystemShift(closedRow.shift),
+        quality: state.styleNo || "",
+        stopsData,
+        stopCount: closedRow.totalStopCount,
+        rawData,
+        lastStartTime: state.lastStartTime,
+        lastStopTime: state.lastStopTime,
+        updatedTime: utcNow()
+    };
+}
+
+async function sendClosedShiftLogs(logs) {
+    const toSend = pendingClosedShiftLogs.concat(logs);
+
+    try {
+        await axiosInstance.post(
+            `${API_BASE_URL}/machine-logs/shift`,
+            {
+                // ARRAY of log objects, each carrying its own machineId - this
+                // endpoint's body shape differs from the regular /machine-logs
+                // push, which is an object keyed by machineId.
+                logs: toSend,
+                workspaceId: WORKSPACE_ID,
+                apiKey: API_KEY
+            }
+        );
+
+        pendingClosedShiftLogs = [];
+        console.log(`[${utcNow()}] Sent ${toSend.length} closed-shift log(s) to TrackWeaving.`);
+    } catch (error) {
+        // Keep them for the next attempt (next TLM-server refresh cycle, or
+        // process restart loses this queue - it's in-memory only). This is
+        // the piece that makes "previous shift data accurate" hold even
+        // across a transient API outage, rather than silently dropping it.
+        pendingClosedShiftLogs = toSend;
+        console.error(
+            `[${utcNow()}] Failed to send closed-shift logs (${toSend.length} queued for retry):`,
+            error && error.message ? error.message : error
+        );
+    }
+}
+
+// ====== MACHINE PROCESSING (per 90s status poll) ======
+function processLoomStatus(machine, result, fetchedAt) {
     const machineId = String(machine.id);
     const state = ensureMachineData(machine);
-    const status = parseStatusCsv(result.files.status);
-
-    let production = null;
-    let tiss = null;
-    let autoSettings = null;
-    let events = null;
-
-    if (result.files.shiftProduction) {
-        production = parseShiftProductionCsv(result.files.shiftProduction);
-        state.cachedProduction = production;
-    } else {
-        production = state.cachedProduction || null;
-    }
-
-    if (result.files.tissStatus) {
-        tiss = parseTissStatusCsv(result.files.tissStatus);
-
-        if (tiss) {
-            state.cachedTissStatus = tiss;
-        }
-    } else {
-        tiss = state.cachedTissStatus || null;
-    }
-
-    if (result.files.autoSettings) {
-        autoSettings = parseAutoSettingsCsv(result.files.autoSettings);
-
-        if (autoSettings) {
-            state.cachedAutoSettings = autoSettings;
-        }
-    } else {
-        autoSettings = state.cachedAutoSettings || null;
-    }
-
-    if (result.files.shiftEvents) {
-        events = parseCurrentShiftEvents(result.files.shiftEvents);
-
-        if (events) {
-            state.cachedEvents = events;
-        }
-    }
-
-    const previousShift = state.shift;
-
-    const currentShift = production
-        ? production.shift
-        : Number.isFinite(previousShift)
-        ? previousShift
-        : 0;
-
-    if (
-        production &&
-        Number.isFinite(previousShift) &&
-        previousShift !== production.shift
-    ) {
-        state.prevData = JSON.parse(JSON.stringify(state));
-        state.stopCount = 0;
-        state.totalStopCount = 0;
-        state.stopsData = blankStopsData();
-        state.stopSummary = summarizeStops([]);
-        state.cachedEvents = null;
-    }
+    const status = result.status;
 
     /*
-     * IMPORTANT:
-     * Use fetchedAt for LIVE stop transitions.
-     * Do not use an old Tsudakoma source timestamp here.
+     * IMPORTANT: use fetchedAt (our own clock) for live stop transitions,
+     * not the loom's own status timestamp.
      */
     applyStopTransition(state, status.currentStop, fetchedAt);
-
-    if (events && events.shift === currentShift) {
-        state.stopsData = buildStopsData(events.events);
-        state.stopSummary = summarizeStops(events.events);
-        state.stopCount = events.events.length;
-
-        state.totalStopCount = production && production.totalStopCount
-            ? production.totalStopCount
-            : events.events.length;
-
-        state.lastEventSyncAt = fetchedAt;
-
-        /*
-         * Do NOT overwrite lastStopTime by finding an old event
-         * having the same stop code.
-         */
-    } else if (production) {
-        state.totalStopCount = production.totalStopCount;
-    }
-
-    const averageRpm = production
-        ? production.rpm
-        : toNumber(state.averageRpm);
-
-    const assumedCurrentRpm = tiss && tiss.assumedCurrentOrSetRpm
-        ? tiss.assumedCurrentOrSetRpm
-        : averageRpm;
-
-    const currentRpm = status.runFlag === 1 ? assumedCurrentRpm : 0;
-
-    const tissDensity = tiss && tiss.assumedWeftDensity
-        ? tiss.assumedWeftDensity
-        : 0;
-
-    const autoDensity = autoSettings && autoSettings.weftDensity
-        ? autoSettings.weftDensity
-        : 0;
-
-    const configuredDensity =
-        toNumber(machine.setPicks) ||
-        toNumber(machine.currentDensity) ||
-        toNumber(machine.weftDensity) ||
-        toNumber(state.weftDensity);
-
-    const weftDensity = tissDensity || autoDensity || configuredDensity;
-
-    const calculatedShiftPicks = production
-        ? production.calculatedShiftPicks
-        : toNumber(state.currentShiftPicks);
-
-    const currentShiftPicks = status.directClothPicks > 0
-        ? Math.round(status.directClothPicks)
-        : calculatedShiftPicks;
-
-    const beamCompletionDatetime = status.beamRemainingHours > 0
-        ? moment.utc(fetchedAt).add(status.beamRemainingHours, "hours").format()
-        : null;
-
-    const runtimeMinutes = production
-        ? production.runtimeMinutes
-        : toNumber(state.runtimeMinutes || state.runtime);
-
-    const millEfficiency = production
-        ? production.millEfficiency
-        : toNumber(state.millEfficiency || state.efficiency);
-
-    const loomEfficiency = production
-        ? production.loomEfficiency
-        : toNumber(state.loomEfficiency || state.efficiency);
-
-    const productionMeter = production
-        ? production.productionMeter
-        : toNumber(state.productionMeter);
-
-    const styleNo = production
-        ? production.styleNo
-        : state.quality || "";
-
-    const totalStopCount = production
-        ? production.totalStopCount
-        : toInteger(state.totalStopCount);
-
-    const normalized = {
-        loomNo: result.loomNo,
-        shift: currentShift,
-        quality: styleNo,
-        currentStop: status.currentStop,
-        currentStopReason: status.currentStop ? stopDefinition(status.currentStop).reason : null,
-        runFlag: status.runFlag,
-        runtimeMinutes,
-        millEfficiency,
-        loomEfficiency,
-        efficiency: loomEfficiency,
-        averageRpm,
-        currentRpm,
-        productionMeter,
-        currentPieceMeter: status.currentPieceMeter,
-        currentShiftPicks,
-        beamOriginalMeter: status.beamOriginalMeter,
-        beamConsumedMeter: status.beamConsumedMeter,
-        beamLeftMeter: status.beamLeftMeter,
-        beamRemainingHours: status.beamRemainingHours,
-        beamCompletionDatetime,
-        weftDensity,
-        totalStopCount,
-        doffNo: status.doffNo
-    };
 
     state.updatedTime = fetchedAt;
     state.lastSuccessfulReadAt = fetchedAt;
@@ -1009,47 +1072,65 @@ function processLoomData(machine, result, fetchedAt) {
     state.isPowerOff = false;
     state.readError = null;
 
-    state.shift = currentShift;
-    state.quality = normalized.quality;
-    state.speed = normalized.currentRpm;
-    state.averageRpm = normalized.averageRpm;
-    state.runtime = normalized.runtimeMinutes;
-    state.runtimeMinutes = normalized.runtimeMinutes;
-    state.efficiency = normalized.efficiency;
-    state.millEfficiency = normalized.millEfficiency;
-    state.loomEfficiency = normalized.loomEfficiency;
-    state.productionMeter = normalized.productionMeter;
-    state.currentShiftPicks = normalized.currentShiftPicks;
-    state.beamLeftMeter = normalized.beamLeftMeter;
-    state.beamCompletionDatetime = normalized.beamCompletionDatetime;
-    state.weftDensity = normalized.weftDensity;
-    state.currentPieceMeter = normalized.currentPieceMeter;
-    state.doffNo = normalized.doffNo;
-    state.currentStopReason = normalized.currentStopReason;
+    state.runFlag = status.runFlag;
+    state.stop = status.currentStop;
+    state.currentStopReason = status.currentStop ? stopDefinition(status.currentStop).reason : null;
+    state.stoppedForSeconds = stoppedForSeconds(state, fetchedAt);
 
-    state.rawData = buildNormalizedRawData(normalized, state.stopsData);
+    state.currentPieceMeter = status.currentPieceMeter;
+    state.beamOriginalMeter = status.beamOriginalMeter;
+    state.beamConsumedMeter = status.beamConsumedMeter;
+    state.beamLeftMeter = status.beamLeftMeter;
+    state.beamRemainingHours = status.beamRemainingHours;
+    state.beamCompletionDatetime = status.beamRemainingHours > 0
+        ? moment.utc(fetchedAt).add(status.beamRemainingHours, "hours").format()
+        : null;
+    state.doffNo = status.doffNo;
+    // I_STATUS.CSV's own pick counter (directClothPicks) is unreliable/often
+    // zero on the live status file - the original code even had a fallback
+    // for this. The manual-confirmed source is Shift-Data item 8 ("Woven
+    // cloth pick number [100 picks]"), refreshed ~5 min via the TLM server.
+    state.currentShiftPicks = status.directClothPicks > 0
+        ? status.directClothPicks
+        : toNumber(state.currentShiftPicksFromTlm);
+
+    // averageRpm comes from the TLM-server Shift-Data reader (confirmed
+    // column, refreshed every TLM_SERVER_POLL_INTERVAL_MS). currentRpm is 0
+    // while stopped, otherwise the last-known average for the shift.
+    state.currentRpm = status.runFlag === 1 ? toNumber(state.averageRpm) : 0;
+
+    state.rawData = [
+        state.shift || 0,
+        state.styleNo || "",
+        status.currentStop,
+        toNumber(state.runtimeMinutes), // from TLM server Shift-Data, refreshes ~5 min
+        toNumber(state.efficiency),     // runtime / elapsed * 100 (manual's Mill/Loom formula), same refresh cadence
+        0, // currentDensity - still no confirmed TLM-server source (see notes)
+        status.currentPieceMeter,
+        status.directClothPicks,
+        status.beamLeftMeter,
+        status.beamOriginalMeter,
+        state.beamCompletionDatetime,
+        // Warp/H1/H2/Other counts+durations: confirmed TLM-server ground truth
+        // for the current shift-so-far (refreshes ~5 min), not our own live
+        // 90s-polling approximation - see stopBreakdown in applyTlmServerDataToMachines.
+        (state.stopBreakdown && state.stopBreakdown.warp.count) || 0,
+        (state.stopBreakdown && state.stopBreakdown.warp.duration) || 0,
+        (state.stopBreakdown && state.stopBreakdown.h1.count) || 0,
+        (state.stopBreakdown && state.stopBreakdown.h1.duration) || 0,
+        (state.stopBreakdown && state.stopBreakdown.h2.count) || 0,
+        (state.stopBreakdown && state.stopBreakdown.h2.duration) || 0,
+        (state.stopBreakdown && state.stopBreakdown.other.count) || 0,
+        (state.stopBreakdown && state.stopBreakdown.other.duration) || 0,
+        state.currentRpm || 0
+    ];
 
     state.source = {
         loomStatusTimestamp: status.sourceTimestamp,
-        shiftProductionTimestamp: production && production.sourceTimestamp
-            ? production.sourceTimestamp
-            : null,
-        tissStatusTimestamp: tiss && tiss.sourceTimestamp
-            ? tiss.sourceTimestamp
-            : null,
         collectedAt: fetchedAt,
         ftpIp: machine.ip,
         loomNo: result.loomNo,
-        provisionalFields: {
-            currentRpm: "TISS status field 6 / 10",
-            weftDensity: "TISS status field 16 / 10"
-        }
-    };
-
-    state.tsudakomaRaw = {
-        status: status.raw,
-        shiftProduction: production && production.raw ? production.raw : null,
-        tissStatus: tiss && tiss.raw ? tiss.raw : null
+        tlmServerLastSyncAt: state.tlmServerLastSyncAt || null
     };
 
     return machineData[machineId];
@@ -1080,12 +1161,7 @@ function markMachinePowerOff(machine, error) {
         state.isPowerOff = true;
         state.wasFtpOffline = true;
         state.currentStopReason = "Power Off";
-        state.speed = 0;
-
-        if (Array.isArray(state.rawData)) {
-            state.rawData[RAW_INDEX.stopCode] = POWER_OFF_STOP_CODE;
-            state.rawData[RAW_INDEX.speedRpm] = 0;
-        }
+        state.stoppedForSeconds = stoppedForSeconds(state, now);
 
         state.updatedTime = now;
 
@@ -1095,55 +1171,24 @@ function markMachinePowerOff(machine, error) {
     }
 }
 
-// ====== POLLING ======
+// ====== POLLING (per loom, status only) ======
 async function pollLoop(machine, control, initialDelayMs) {
     const machineId = String(machine.id);
 
     await sleep(initialDelayMs);
 
-    let lastProductionPollAt = 0;
-    let lastTissPollAt = 0;
-    let lastAutoPollAt = 0;
-    let lastEventPollAt = 0;
-    let backoffMs = POLL_INTERVAL_MS;
+    let backoffMs = STATUS_POLL_INTERVAL_MS;
 
     while (!shuttingDown && !control.cancelled) {
         const startedAt = Date.now();
 
         try {
-            const includeProduction =
-                !lastProductionPollAt ||
-                startedAt - lastProductionPollAt >= PRODUCTION_POLL_INTERVAL_MS;
-
-            const includeTiss =
-                !lastTissPollAt ||
-                startedAt - lastTissPollAt >= TISS_POLL_INTERVAL_MS;
-
-            const includeAuto =
-                !lastAutoPollAt ||
-                startedAt - lastAutoPollAt >= AUTO_POLL_INTERVAL_MS;
-
-            const includeEvents =
-                !lastEventPollAt ||
-                startedAt - lastEventPollAt >= EVENT_POLL_INTERVAL_MS;
-
-            const result = await readLoomFiles(control.machine, {
-                includeProduction,
-                includeTiss,
-                includeAuto,
-                includeEvents
-            });
-
+            const result = await readLoomStatus(control.machine);
             const fetchedAt = utcNow();
 
-            processLoomData(control.machine, result, fetchedAt);
+            processLoomStatus(control.machine, result, fetchedAt);
 
-            if (includeProduction) lastProductionPollAt = startedAt;
-            if (includeTiss) lastTissPollAt = startedAt;
-            if (includeAuto) lastAutoPollAt = startedAt;
-            if (includeEvents) lastEventPollAt = startedAt;
-
-            backoffMs = POLL_INTERVAL_MS;
+            backoffMs = STATUS_POLL_INTERVAL_MS;
 
             const state = machineData[machineId];
 
@@ -1151,13 +1196,8 @@ async function pollLoop(machine, control, initialDelayMs) {
             healthStats.totalReadMs += result.readDurationMs;
             healthStats.totalQueueMs += result.queueWaitMs;
 
-            if (result.readDurationMs > healthStats.maxReadMs) {
-                healthStats.maxReadMs = result.readDurationMs;
-            }
-
-            if (result.queueWaitMs > healthStats.maxQueueMs) {
-                healthStats.maxQueueMs = result.queueWaitMs;
-            }
+            if (result.readDurationMs > healthStats.maxReadMs) healthStats.maxReadMs = result.readDurationMs;
+            if (result.queueWaitMs > healthStats.maxQueueMs) healthStats.maxQueueMs = result.queueWaitMs;
 
             const loomLabel = String(result.loomNo).padStart(3, "0");
 
@@ -1184,28 +1224,10 @@ async function pollLoop(machine, control, initialDelayMs) {
                 );
             }
 
-            if (result.files.shiftProductionError && !isExpectedOptionalFileError(result.files.shiftProductionError)) {
-                console.warn(
-                    `[${fetchedAt}] ${control.machine.ip} I_SHIFTPRD.CSV skipped: ${result.files.shiftProductionError}`
-                );
-            }
-
-            if (result.files.tissStatusError && !isExpectedOptionalFileError(result.files.tissStatusError)) {
-                console.warn(
-                    `[${fetchedAt}] ${control.machine.ip} TISS status skipped: ${result.files.tissStatusError}`
-                );
-            }
-
-            if (result.files.autoSettingsError && !isExpectedOptionalFileError(result.files.autoSettingsError)) {
-                console.warn(
-                    `[${fetchedAt}] ${control.machine.ip} I_AUTO.CSV skipped: ${result.files.autoSettingsError}`
-                );
-            }
-
-            if (result.files.shiftEventsError && !isExpectedOptionalFileError(result.files.shiftEventsError)) {
-                console.warn(
-                    `[${fetchedAt}] ${control.machine.ip} I_SHIFTEVT.CSV skipped: ${result.files.shiftEventsError}`
-                );
+            if (state.stop && state.stoppedForSeconds >= STOP_HIGHLIGHT_SECONDS) {
+                // This is the condition your dashboard card highlight should mirror.
+                // Left as a log line here; TrackWeaving/backend can apply the same
+                // check against `stop` + `stoppedForSeconds` in the pushed payload.
             }
         } catch (error) {
             const state = ensureMachineData(control.machine);
@@ -1222,15 +1244,15 @@ async function pollLoop(machine, control, initialDelayMs) {
             markMachinePowerOff(control.machine, error);
 
             backoffMs = Math.min(
-                Math.max(POLL_INTERVAL_MS, Math.round(backoffMs * 1.5)),
-                MAX_FAILURE_BACKOFF_MS
+                Math.max(STATUS_POLL_INTERVAL_MS, Math.round(backoffMs * 1.5)),
+                MAX_FAILURE_BACKOFF_MS + STATUS_POLL_INTERVAL_MS
             );
         }
 
         const elapsed = Date.now() - startedAt;
-        const jitter = Math.floor(Math.random() * 500);
+        const jitter = Math.floor(Math.random() * 1000);
 
-        await sleep(Math.max(500, backoffMs - elapsed) + jitter);
+        await sleep(Math.max(1000, backoffMs - elapsed) + jitter);
     }
 }
 
@@ -1252,9 +1274,12 @@ function startOrUpdatePoller(machine, index) {
     pollers.set(id, control);
     ensureMachineData(machine);
 
-    const initialDelayMs = index * 100;
+    // Spread start times across the poll interval so 96 looms don't all
+    // fire in the same instant - keeps effective concurrency close to
+    // MAX_CONCURRENT_FTP instead of bursting past it every cycle.
+    const spreadMs = Math.floor((index / Math.max(1, pollers.size)) * STATUS_POLL_INTERVAL_MS);
 
-    pollLoop(machine, control, initialDelayMs).catch((error) => {
+    pollLoop(machine, control, spreadMs).catch((error) => {
         handlePollLoopError(error, id);
     });
 }
@@ -1277,7 +1302,7 @@ async function fetchMachines() {
     return response.data && response.data.data ? response.data.data : {};
 }
 
-function applyMachineConfiguration(initData, source) {
+function applyMachineConfiguration(initData) {
     const serverMachineData = initData.machineData || {};
 
     for (const [machineId, data] of Object.entries(serverMachineData)) {
@@ -1289,9 +1314,19 @@ function applyMachineConfiguration(initData, source) {
     const machines = (initData.machines || []).filter(isTsudakomaMachine);
     const activeIds = new Set(machines.map((machine) => String(machine.id)));
 
+    const newLoomMap = new Map();
+
     machines.forEach((machine, index) => {
         startOrUpdatePoller(machine, index);
+
+        try {
+            newLoomMap.set(resolveLoomNumber(machine), String(machine.id));
+        } catch (error) {
+            console.warn(`[${utcNow()}] Could not resolve loom number for machine ${machine.id}`);
+        }
     });
+
+    loomNoToMachineId = newLoomMap;
 
     for (const [id, control] of pollers.entries()) {
         if (!activeIds.has(id)) {
@@ -1307,7 +1342,7 @@ async function machineRefreshLoop() {
     const cached = loadMachineCache();
 
     if (cached && cached.data) {
-        const cachedCount = applyMachineConfiguration(cached.data, "local cache");
+        const cachedCount = applyMachineConfiguration(cached.data);
         console.log(`[${utcNow()}] Loaded ${cachedCount} Tsudakoma machines from local cache.`);
     }
 
@@ -1317,7 +1352,7 @@ async function machineRefreshLoop() {
     while (!shuttingDown) {
         try {
             const initData = await fetchMachines();
-            const machineCount = applyMachineConfiguration(initData, "TrackWeaving");
+            const machineCount = applyMachineConfiguration(initData);
             saveMachineCache(initData);
 
             if (machineApiOffline) {
@@ -1356,6 +1391,7 @@ async function dataPushLoop() {
     while (!shuttingDown) {
         try {
             const dataToSend = {};
+            const now = utcNow();
 
             for (const [machineId, data] of Object.entries(machineData)) {
                 if (
@@ -1366,13 +1402,25 @@ async function dataPushLoop() {
                         displayType: data.displayType,
                         lastStopTime: data.lastStopTime,
                         lastStartTime: data.lastStartTime,
-                        prevData: data.prevData,
                         stopCount: data.stopCount,
                         stopsData: data.stopsData,
                         stop: data.stop,
+                        stoppedForSeconds: stoppedForSeconds(data, now),
                         powerOff: data.isPowerOff,
                         rawData: data.rawData,
-                        shift: data.shift
+                        shift: data.shift,
+                        // From the TLM main-server reader (production totals only -
+                        // see the note above readTlmServerSnapshot for what's NOT included)
+                        styleNo: data.styleNo || null,
+                        lotNo: data.lotNo || null,
+                        lotStartMeter: data.lotStartMeter,
+                        lotStartPicks: data.lotStartPicks,
+                        elapsedMinutes: data.elapsedMinutes,
+                        availableMinutes: data.availableMinutes,
+                        runtimeMinutes: data.runtimeMinutes,
+                        efficiency: data.efficiency,
+                        averageRpm: data.averageRpm,
+                        tlmServerLastSyncAt: data.tlmServerLastSyncAt || null
                     };
                 }
             }
@@ -1386,12 +1434,6 @@ async function dataPushLoop() {
                         apiKey: API_KEY
                     }
                 );
-
-                for (const machineId of Object.keys(dataToSend)) {
-                    if (machineData[machineId] && machineData[machineId].prevData) {
-                        machineData[machineId].prevData = null;
-                    }
-                }
 
                 if (dataPushOffline) {
                     console.log(`[${utcNow()}] TrackWeaving data upload recovered.`);
@@ -1421,10 +1463,14 @@ async function dataPushLoop() {
 function logHealthSummary() {
     let powerOff = 0;
     let readErrors = 0;
+    let highlighted = 0;
+
+    const now = utcNow();
 
     for (const data of Object.values(machineData)) {
         if (data.isPowerOff) powerOff += 1;
         if (data.readError) readErrors += 1;
+        if (data.stop && stoppedForSeconds(data, now) >= STOP_HIGHLIGHT_SECONDS) highlighted += 1;
     }
 
     const reads = healthStats.ftpReads;
@@ -1432,8 +1478,9 @@ function logHealthSummary() {
     const avgQueue = reads ? Math.round(healthStats.totalQueueMs / reads) : 0;
 
     console.log(
-        `[${utcNow()}] HEALTH machines=${pollers.size}` +
+        `[${now}] HEALTH machines=${pollers.size}` +
         ` powerOff=${powerOff}` +
+        ` highlighted(>=${STOP_HIGHLIGHT_SECONDS}s)=${highlighted}` +
         ` readErrors=${readErrors}` +
         ` reads=${reads}` +
         ` ftpErrors=${healthStats.ftpReadErrors}` +
@@ -1444,7 +1491,9 @@ function logHealthSummary() {
         ` slowReads=${healthStats.slowReads}` +
         ` slowQueues=${healthStats.slowQueues}` +
         ` machineApi=${machineApiOffline ? "DOWN" : "OK"}` +
-        ` dataApi=${dataPushOffline ? "DOWN" : "OK"}`
+        ` dataApi=${dataPushOffline ? "DOWN" : "OK"}` +
+        ` tlmServer=${tlmServerOffline ? "DOWN" : "OK"}` +
+        ` tlmServerLastSync=${tlmServerLastFetchedAt || "never"}`
     );
 
     healthStats.ftpReads = 0;
@@ -1458,21 +1507,27 @@ function logHealthSummary() {
 }
 
 function healthHandler(req, res) {
+    const now = utcNow();
+
     const machines = Object.entries(machineData).map(([id, data]) => ({
         id,
         updatedTime: data.updatedTime || null,
         stop: data.stop,
+        stoppedForSeconds: stoppedForSeconds(data, now),
+        highlighted: Boolean(data.stop) && stoppedForSeconds(data, now) >= STOP_HIGHLIGHT_SECONDS,
         isPowerOff: Boolean(data.isPowerOff),
         readError: data.readError || null
     }));
 
     res.json({
         ok: true,
-        time: utcNow(),
+        time: now,
         machineCount: machines.length,
         activePollers: pollers.size,
         machineApiOnline: !machineApiOffline,
         dataApiOnline: !dataPushOffline,
+        tlmServerOnline: !tlmServerOffline,
+        tlmServerLastFetchedAt,
         machines
     });
 }
@@ -1483,11 +1538,11 @@ function healthServerStarted() {
     console.log(`Tsudakoma reader health server: http://localhost:${HTTP_PORT}/health`);
 
     console.log(
-        `FTP status every ${POLL_INTERVAL_MS}ms, ` +
-        `production ${PRODUCTION_POLL_INTERVAL_MS}ms, ` +
-        `TISS ${TISS_POLL_INTERVAL_MS}ms, ` +
-        `events ${EVENT_POLL_INTERVAL_MS}ms, ` +
-        `max FTP sessions ${MAX_CONCURRENT_FTP}`
+        `Status poll every ${STATUS_POLL_INTERVAL_MS}ms per loom, ` +
+        `max concurrent FTP sessions ${MAX_CONCURRENT_FTP}, ` +
+        `stop highlight threshold ${STOP_HIGHLIGHT_SECONDS}s, ` +
+        `TLM server sync every ${TLM_SERVER_POLL_INTERVAL_MS}ms` +
+        (TLM_SERVER_HOST ? ` (${TLM_SERVER_HOST})` : " (not configured)")
     );
 }
 
@@ -1501,12 +1556,22 @@ async function start() {
         console.warn("FTP_PASSWORD is empty. Set it before production use.");
     }
 
+    if (!TLM_SERVER_HOST) {
+        console.warn(
+            "TLM_SERVER_HOST is empty. Production data from the TLM main computer will not be fetched."
+        );
+    }
+
     app.listen(HTTP_PORT, healthServerStarted);
 
     setInterval(logHealthSummary, HEALTH_SUMMARY_INTERVAL_MS).unref();
 
     machineRefreshLoop().catch((error) => {
         console.error("Machine refresh loop failed:", error);
+    });
+
+    tlmServerRefreshLoop().catch((error) => {
+        console.error("TLM server refresh loop failed:", error);
     });
 
     dataPushLoop().catch((error) => {
@@ -1550,12 +1615,12 @@ module.exports = {
     RAW_INDEX,
     STOP_CODE,
     parseStatusCsv,
-    parseShiftProductionCsv,
-    parseTissStatusCsv,
-    parseAutoSettingsCsv,
-    parseCurrentShiftEvents,
-    buildStopsData,
-    summarizeStops,
-    processLoomData,
+    parseHeaderedCsv,
+    parseTlmServerStatusRow,
+    parseTlmServerProductLoomRow,
+    parseShiftDataRow,
+    SHIFT_DATA_INDEX,
+    applyStopTransition,
+    stoppedForSeconds,
     resolveLoomNumber
 };
