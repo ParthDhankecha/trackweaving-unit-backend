@@ -1107,7 +1107,7 @@ function processLoomStatus(machine, result, fetchedAt) {
         toNumber(state.efficiency),     // runtime / elapsed * 100 (manual's Mill/Loom formula), same refresh cadence
         0, // currentDensity - still no confirmed TLM-server source (see notes)
         status.currentPieceMeter,
-        status.directClothPicks,
+        state.currentShiftPicks,
         status.beamLeftMeter,
         status.beamOriginalMeter,
         state.beamCompletionDatetime,
@@ -1420,6 +1420,7 @@ async function dataPushLoop() {
                         runtimeMinutes: data.runtimeMinutes,
                         efficiency: data.efficiency,
                         averageRpm: data.averageRpm,
+                        currentShiftProductionMeter: data.currentShiftClothLength, // Shift-Data item 9, resets per shift - NOT pieceLengthM (which is per-piece, can span shifts)
                         tlmServerLastSyncAt: data.tlmServerLastSyncAt || null
                     };
                 }
