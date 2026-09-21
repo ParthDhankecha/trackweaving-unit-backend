@@ -3,3 +3,5 @@ node_modules/
 .DS_Store
 pending-shift-logs.json
 pending-shift-logs.json.tmp
+local-state.json
+local-state.json.tmp

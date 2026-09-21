@@ -1,6 +1,8 @@
 // server.js / index.js
 const express = require("express");
 const axios = require("axios");
+const http = require("http");
+const https = require("https");
 const ModbusRTU = require("modbus-serial");
 const moment = require("moment");
 const fs = require("fs");
@@ -14,12 +16,24 @@ const START_ADDR = parseInt(process.env.START_ADDR || "5000", 10);
 const COUNT = parseInt(process.env.COUNT || "74", 10);
 const ZERO_BASED = true;
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || "7000", 10);
+const DATA_STORE_INTERVAL_MS = parseInt(process.env.DATA_STORE_INTERVAL_MS || "5000", 10);
 const API_TIMEOUT_MS = parseInt(process.env.API_TIMEOUT_MS || "15000", 10);
+const API_BACKOFF_MAX_MS = parseInt(process.env.API_BACKOFF_MAX_MS || "60000", 10);
+const CONNECT_BACKOFF_MAX_MS = parseInt(process.env.CONNECT_BACKOFF_MAX_MS || "30000", 10);
+const LOCAL_STATE_INTERVAL_MS = parseInt(process.env.LOCAL_STATE_INTERVAL_MS || "15000", 10);
 
 const workspaceId = "6aae2913246baf82dce97b83";
 const apiKey = "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21";
 const API_BASE_URL = process.env.API_BASE_URL || "https://trackweaving.com/api/v1";
 const PENDING_SHIFT_LOGS_PATH = process.env.PENDING_SHIFT_LOGS_PATH || path.join(process.cwd(), "pending-shift-logs.json");
+const LOCAL_STATE_PATH = process.env.LOCAL_STATE_PATH || path.join(process.cwd(), "local-state.json");
+
+const apiClient = axios.create({
+    timeout: API_TIMEOUT_MS,
+    proxy: false,
+    httpAgent: new http.Agent({ keepAlive: false }),
+    httpsAgent: new https.Agent({ keepAlive: false }),
+});
 
 const REGISTER = {
     nazon: {
@@ -44,12 +58,129 @@ const REGISTER = {
 
 let machineData = {};
 let pendingShiftLogs = [];
+let machines = [];
+let apiBackoffMs = DATA_STORE_INTERVAL_MS;
+let consecutiveApiFailures = 0;
+let lastApiError = null;
 
 // Track all active clients for graceful shutdown
 const allClients = new Set();
+const startedMachineIds = new Set();
 
 // ====== HELPERS ======
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function writeJsonAtomic(filePath, value) {
+    const tmpPath = `${filePath}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(value, null, 2));
+    fs.renameSync(tmpPath, filePath);
+}
+
+function noteApiSuccess() {
+    if (consecutiveApiFailures > 0) {
+        console.log(`API recovered after ${consecutiveApiFailures} failed attempt(s)`);
+    }
+    consecutiveApiFailures = 0;
+    lastApiError = null;
+    apiBackoffMs = DATA_STORE_INTERVAL_MS;
+}
+
+function noteApiFailure(prefix, error) {
+    consecutiveApiFailures += 1;
+    lastApiError = error?.message || String(error);
+    apiBackoffMs = Math.min(Math.max(apiBackoffMs * 2, DATA_STORE_INTERVAL_MS), API_BACKOFF_MAX_MS);
+
+    if (consecutiveApiFailures <= 3 || consecutiveApiFailures % 10 === 0) {
+        console.log(
+            `${prefix} (#${consecutiveApiFailures}): ${lastApiError}. Retrying in ${Math.round(apiBackoffMs / 1000)}s`,
+        );
+    }
+}
+
+function seedMachineData(incoming) {
+    if (!incoming || typeof incoming !== "object") {
+        return;
+    }
+
+    for (const [machineId, state] of Object.entries(incoming)) {
+        if (!machineData[machineId]) {
+            machineData[machineId] = state;
+        }
+    }
+}
+
+function persistLocalState() {
+    if (!machines.length && !Object.keys(machineData).length) {
+        return;
+    }
+
+    try {
+        writeJsonAtomic(LOCAL_STATE_PATH, {
+            savedAt: new Date().toISOString(),
+            machines,
+            machineData,
+        });
+    } catch (error) {
+        console.error("Failed to persist local state:", error.message);
+    }
+}
+
+function loadLocalState() {
+    try {
+        if (!fs.existsSync(LOCAL_STATE_PATH)) {
+            return;
+        }
+
+        const parsed = JSON.parse(fs.readFileSync(LOCAL_STATE_PATH, "utf8"));
+        if (Array.isArray(parsed?.machines) && parsed.machines.length) {
+            machines = parsed.machines;
+        }
+        if (parsed?.machineData && typeof parsed.machineData === "object") {
+            seedMachineData(parsed.machineData);
+        }
+        if (machines.length) {
+            console.log(
+                `Loaded local cache: ${machines.length} machine(s), ${Object.keys(machineData).length} state record(s)`,
+            );
+        }
+    } catch (error) {
+        console.error("Failed to load local state:", error.message);
+    }
+}
+
+function collectLiveLogs() {
+    const dataToSend = {};
+    for (const machineId of Object.keys(machineData)) {
+        const m = machineData[machineId];
+        if (m.updatedTime && moment().diff(moment(m.updatedTime), "hours") < 1) {
+            dataToSend[machineId] = { ...m };
+            delete dataToSend[machineId].prevData;
+        }
+    }
+    return dataToSend;
+}
+
+function startPollLoops(machineList) {
+    if (!Array.isArray(machineList) || !machineList.length) {
+        return 0;
+    }
+
+    machines = machineList;
+    let started = 0;
+
+    for (const machine of machineList) {
+        if (!machine?.id || startedMachineIds.has(machine.id)) {
+            continue;
+        }
+        startedMachineIds.add(machine.id);
+        started += 1;
+        pollLoop(machine).catch((e) => {
+            console.error(`pollLoop crashed for machine ${machine.id}:`, e);
+        });
+    }
+
+    return started;
+}
 
 function initMachineData(machineId, displayType) {
     machineData[machineId] = {
@@ -90,9 +221,7 @@ function loadPendingShiftLogs() {
 }
 
 function persistPendingShiftLogs() {
-    const tmpPath = `${PENDING_SHIFT_LOGS_PATH}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify({ logs: pendingShiftLogs }, null, 2));
-    fs.renameSync(tmpPath, PENDING_SHIFT_LOGS_PATH);
+    writeJsonAtomic(PENDING_SHIFT_LOGS_PATH, { logs: pendingShiftLogs });
 }
 
 function enqueueClosedShiftLog(machineId, state, endedAt) {
@@ -112,6 +241,7 @@ function enqueueClosedShiftLog(machineId, state, endedAt) {
 
     try {
         persistPendingShiftLogs();
+        persistLocalState();
         console.log(
             `[${machineId}] Stored closed shift locally (${pendingShiftLogs.length} pending)`,
         );
@@ -138,11 +268,11 @@ async function flushPendingShiftLogs() {
 
     const toFlush = pendingShiftLogs.slice();
 
-    await axios.post(`${API_BASE_URL}/machine-logs/shift`, {
+    await apiClient.post(`${API_BASE_URL}/machine-logs/shift`, {
         logs: toFlush,
         workspaceId,
         apiKey,
-    }, { timeout: API_TIMEOUT_MS });
+    });
 
     removePendingShiftLogs(toFlush.map((log) => log.id));
     console.log(`Flushed ${toFlush.length} closed shift log(s)`);
@@ -339,9 +469,11 @@ async function pollLoop(machine) {
             // sometimes throws uncaught on its own TCP timeout.
             console.log(`Connected to ${ip}:${LOOM_PORT} (UNIT_ID=${unitId})`);
             lastError = null;
+            backoffMs = POLL_INTERVAL_MS;
         } catch (e) {
             lastError = e?.message || String(e);
             console.log(`Connect error for ${ip}:`, lastError);
+            backoffMs = Math.min(Math.max(backoffMs * 2, POLL_INTERVAL_MS), CONNECT_BACKOFF_MAX_MS);
             try {
                 if (client.isOpen) client.close();
             } catch (_) {}
@@ -369,7 +501,7 @@ async function pollLoop(machine) {
                         if (client.isOpen) client.close();
                     } catch (_) {}
                     // increase backoff
-                    backoffMs = Math.min(backoffMs * 2, 10000);
+                    backoffMs = Math.min(backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
                     await sleep(backoffMs);
                     continue;
                 }
@@ -398,69 +530,84 @@ async function pollLoop(machine) {
             try {
                 if (client.isOpen) client.close();
             } catch (_) {}
-            backoffMs = Math.min(backoffMs * 2, 10000);
+            backoffMs = Math.min(backoffMs * 2, CONNECT_BACKOFF_MAX_MS);
         }
 
-        await sleep(backoffMs);
+        await sleep(backoffMs + Math.floor(Math.random() * 1000));
     }
 }
 
 // ====== INIT ALL MACHINES ======
+async function fetchMachineList() {
+    const initData = await apiClient.post(`${API_BASE_URL}/machine-logs/machine-list`, {
+        workspaceId,
+        apiKey,
+    });
+
+    return initData.data?.data || {};
+}
+
 async function initAllMachines() {
-    let initData = await axios.post(
-        `${API_BASE_URL}/machine-logs/machine-list`,
-        {
-            workspaceId,
-            apiKey
-        },
-        { timeout: API_TIMEOUT_MS }
-    );
+    while (true) {
+        try {
+            const remote = await fetchMachineList();
+            seedMachineData(remote.machineData);
+            const started = startPollLoops(remote.machines || []);
+            persistLocalState();
+            noteApiSuccess();
+            console.log(`Polling ${started} machine(s) from API`);
+            return;
+        } catch (error) {
+            if (machines.length) {
+                const started = startPollLoops(machines);
+                persistLocalState();
+                console.error(
+                    `Failed to fetch machine list (${error.message}). Using local cache for ${started} machine(s)`,
+                );
+                return;
+            }
 
-    initData = initData.data;
-
-    // preload machineData if backend sends something
-    machineData = initData.data.machineData || {};
-
-    for (let machine of initData.data.machines) {
-        // fire and forget, each has its own loop and connection
-        pollLoop(machine).catch((e) => {
-            console.error(`pollLoop crashed for machine ${machine.id}:`, e);
-        });
+            noteApiFailure("Failed to init machines", error);
+            await sleep(apiBackoffMs);
+        }
     }
 }
 
 // ====== PERIODIC DATA PUSH ======
 async function dataStoreLoop() {
     while (true) {
-        try {
-            const dataToSend = {};
-            for (let machineId in machineData) {
-                const m = machineData[machineId];
-                if (
-                    m.updatedTime &&
-                    moment().diff(moment(m.updatedTime), "hours") < 1
-                ) {
-                    dataToSend[machineId] = { ...m };
-                    delete dataToSend[machineId].prevData;
-                }
-            }
+        const dataToSend = collectLiveLogs();
+        const hasLive = Object.keys(dataToSend).length > 0;
 
-            await axios.post(`${API_BASE_URL}/machine-logs`, {
-                logs: dataToSend,
-                workspaceId,
-                apiKey
-            }, { timeout: API_TIMEOUT_MS });
-
-            try {
-                await flushPendingShiftLogs();
-            } catch (error) {
-                console.log("Shift log flush error:", error.message || error);
-            }
-        } catch (error) {
-            console.log("Error in data store interval:", error.message || error);
+        if (!hasLive && !pendingShiftLogs.length) {
+            await sleep(DATA_STORE_INTERVAL_MS);
+            continue;
         }
 
-        await sleep(5000);
+        try {
+            if (hasLive) {
+                await apiClient.post(`${API_BASE_URL}/machine-logs`, {
+                    logs: dataToSend,
+                    workspaceId,
+                    apiKey,
+                });
+            }
+
+            await flushPendingShiftLogs();
+            noteApiSuccess();
+        } catch (error) {
+            persistLocalState();
+            noteApiFailure("Error in data store interval", error);
+        }
+
+        await sleep(hasLive || pendingShiftLogs.length ? apiBackoffMs : DATA_STORE_INTERVAL_MS);
+    }
+}
+
+async function localPersistLoop() {
+    while (true) {
+        persistLocalState();
+        await sleep(LOCAL_STATE_INTERVAL_MS);
     }
 }
 
@@ -473,6 +620,11 @@ app.get("/health", (req, res) => {
         time: new Date(),
         machines: Object.keys(machineData).length,
         pendingShiftLogs: pendingShiftLogs.length,
+        api: {
+            consecutiveFailures: consecutiveApiFailures,
+            lastError: lastApiError,
+            retryInMs: consecutiveApiFailures ? apiBackoffMs : 0,
+        },
     });
 });
 
@@ -484,9 +636,13 @@ app.listen(PORT, () => {
         `Polling start=${START_ADDR} count=${COUNT} zeroBased=${ZERO_BASED}`
     );
     loadPendingShiftLogs();
+    loadLocalState();
     if (pendingShiftLogs.length) {
         console.log(`Pending closed shift logs on disk: ${pendingShiftLogs.length}`);
     }
+    localPersistLoop().catch((e) => {
+        console.error("localPersistLoop crashed:", e);
+    });
     dataStoreLoop().catch((e) => {
         console.error("dataStoreLoop crashed:", e);
     });
@@ -511,13 +667,16 @@ process.on("unhandledRejection", (reason) => {
     console.error("Unhandled promise rejection:", reason);
 });
 
-// graceful shutdown
-process.on("SIGINT", async () => {
-    console.log("Gracefully shutting down...");
+function shutdown(signal) {
+    console.log(`Gracefully shutting down (${signal})...`);
+    persistLocalState();
     for (const client of allClients) {
         try {
             if (client.isOpen) client.close();
         } catch (_) {}
     }
     process.exit(0);
-});
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
