@@ -64,6 +64,11 @@ const IDS = {
 
 const TRACKED_IDS = new Set(Object.values(IDS));
 
+const STOP_REASON_LATCH_MS = 5000;
+
+const H1_STOP_CODES = new Set([901, 903, 905, 907, 909, 911, 915]);
+const H2_STOP_CODES = new Set([902, 904, 906, 908, 910, 912, 913, 914, 916]);
+
 /*
 |--------------------------------------------------------------------------
 | Runtime state
@@ -203,6 +208,22 @@ function initMachineData(machine) {
             ? Number(existing.stop)
             : 0,
         stopReasonText: existing.stopReasonText || null,
+        activeStop: existing.activeStop || (
+            existing.lastStopTime && Number.isFinite(Number(existing.stop)) && Number(existing.stop) !== 0
+                ? {
+                    start: existing.lastStopTime,
+                    statusCode: Number(existing.stop),
+                    reasonText: existing.stopReasonText || null,
+                    category: classifyStop(Number(existing.stop), existing.stopReasonText),
+                }
+                : null
+        ),
+        recentStopReason: existing.recentStopReason || null,
+        machineRunning: typeof existing.machineRunning === "boolean"
+            ? existing.machineRunning
+            : Number.isFinite(Number(existing.stop)) && Number(existing.stop) !== 0
+                ? false
+                : null,
         shift: existingShift,
         shiftCode: existing.shiftCode || null,
         shiftRaw: existing.shiftRaw != null ? existing.shiftRaw : null,
@@ -315,7 +336,20 @@ async function flushPendingShiftLogs() {
 */
 
 function classifyStop(stopCode, stopText) {
+    const code = Number(stopCode);
     const text = String(stopText || "").trim().toLowerCase();
+
+    if (H1_STOP_CODES.has(code)) {
+        return "h1";
+    }
+
+    if (H2_STOP_CODES.has(code)) {
+        return "h2";
+    }
+
+    if (code === 6) {
+        return "warp";
+    }
 
     if (/\bh1\b/.test(text) || /c[1-8]\s*h1/.test(text) || /weft.*h1/.test(text)) {
         return "h1";
@@ -329,9 +363,67 @@ function classifyStop(stopCode, stopText) {
         return "warp";
     }
 
-    void stopCode;
-
     return "other";
+}
+
+function getStopReasonPriority(stopCode) {
+    const code = Number(stopCode);
+
+    if (H1_STOP_CODES.has(code) || H2_STOP_CODES.has(code)) {
+        return 100;
+    }
+
+    if (code === 6) {
+        return 80;
+    }
+
+    if (code === 5 || code === 2 || code === 3) {
+        return 60;
+    }
+
+    if (code === 1 || code === 10 || code === 12) {
+        return 20;
+    }
+
+    return code ? 40 : 0;
+}
+
+function rememberStopReason(state, stopCode, stopText) {
+    const code = integerOrNull(stopCode);
+
+    if (!code) {
+        return;
+    }
+
+    const now = Date.now();
+    const existing = state.recentStopReason;
+    const expired = !existing || now - existing.time > STOP_REASON_LATCH_MS;
+    const higherPriority = !existing || getStopReasonPriority(code) > getStopReasonPriority(existing.code);
+
+    if (expired || higherPriority) {
+        state.recentStopReason = {
+            code,
+            text: stopText || null,
+            time: now,
+        };
+    }
+}
+
+function resolveStopReason(state, stopReasonCode, stopReasonText, machineState) {
+    let code = stopReasonCode || machineState.stateCode || 1;
+    let text = stopReasonText;
+    const recent = state.recentStopReason;
+
+    if (recent && Date.now() - recent.time <= STOP_REASON_LATCH_MS && getStopReasonPriority(recent.code) >= getStopReasonPriority(code)) {
+        code = recent.code;
+        text = recent.text || text;
+    }
+
+    return {
+        code,
+        text,
+        category: classifyStop(code, text),
+    };
 }
 
 /*
@@ -340,21 +432,21 @@ function classifyStop(stopCode, stopText) {
 |--------------------------------------------------------------------------
 */
 
-function completeCurrentStop(machineId) {
+function completeCurrentStop(machineId, endedAt) {
     const data = machineData[machineId];
 
-    if (!data || !data.lastStopTime) {
+    if (!data || !data.activeStop) {
         return;
     }
 
-    const now = moment().utc();
-    const stopStart = moment(data.lastStopTime);
+    const now = endedAt ? moment(endedAt) : moment().utc();
+    const stopStart = moment(data.activeStop.start);
     const duration = Math.max(0, now.diff(stopStart, "seconds"));
-    const category = classifyStop(data.stop, data.stopReasonText);
+    const category = data.activeStop.category || classifyStop(data.activeStop.statusCode, data.activeStop.reasonText);
     const entry = {
-        start: data.lastStopTime,
+        start: data.activeStop.start,
         end: now.format(),
-        statusCode: data.stop,
+        statusCode: data.activeStop.statusCode,
         category,
         duration,
     };
@@ -372,6 +464,7 @@ function completeCurrentStop(machineId) {
     }
 
     data.stopsData[category].push(entry);
+    data.activeStop = null;
 }
 
 /*
@@ -422,12 +515,10 @@ function getMachineState(values) {
      * The panel project treats state >= 20
      * as running.
      */
-    if(speed !== null && speed > 20) {
-        running = true;
-    } else if (stateCode !== null) {
+    if (stateCode !== null) {
         running = stateCode >= 20;
-    } else if (speed !== null) {
-        running = speed > 0;
+    } else if(speed !== null) {
+        running = speed > 200;
     }
 
     return {
@@ -646,24 +737,31 @@ class HaiwellMachineReader {
         const currentShiftRaw = shiftInfo ? shiftInfo.raw : null;
         const stopReasonCode = integerOrNull(this.values.get(IDS.stopReasonCode));
         const stopReasonText = textOrNull(this.values.get(IDS.stopReasonText));
+        const wasRunning = state.machineRunning;
+        const isRunning = machineState.running;
         let currentStop = 0;
 
-        if (machineState.running === false) {
-            currentStop = stopReasonCode || machineState.stateCode || 1;
+        if (stopReasonCode) {
+            rememberStopReason(state, stopReasonCode, stopReasonText);
         }
 
-        if (state.stop === 0 && currentStop !== 0) {
+        if (isRunning === false && wasRunning !== false && !state.activeStop) {
+            const stopReason = resolveStopReason(state, stopReasonCode, stopReasonText, machineState);
+
+            state.activeStop = {
+                start: nowUtc,
+                statusCode: stopReason.code,
+                reasonText: stopReason.text,
+                category: stopReason.category,
+            };
             state.lastStopTime = nowUtc;
-            state.stopReasonText = stopReasonText;
         }
-        if (state.stop !== 0 && currentStop === 0) {
+
+        if (isRunning === true && wasRunning === false) {
             state.lastStartTime = nowUtc;
-            completeCurrentStop(this.machineId);
+            completeCurrentStop(this.machineId, nowUtc);
             state.lastStopTime = null;
-        }
-        if (state.stop !== 0 && currentStop !== 0 && (state.stop !== currentStop || (stopReasonText && state.stopReasonText !== stopReasonText))) {
-            completeCurrentStop(this.machineId);
-            state.lastStopTime = nowUtc;
+            state.recentStopReason = null;
         }
 
         const previousShift = state.shift;
@@ -677,21 +775,38 @@ class HaiwellMachineReader {
 
         if (panelShiftChanged) {
             console.log(`[${this.machineId}] Shift changed: ` + `${previousShiftRaw} -> ${currentShiftRaw}`);
-            if (state.stop !== 0 && currentStop !== 0) {
-                completeCurrentStop(this.machineId);
-                state.lastStopTime = nowUtc;
+            let continuedStop = null;
+
+            if (state.activeStop && isRunning === false) {
+                continuedStop = { ...state.activeStop };
+                completeCurrentStop(this.machineId, nowUtc);
             }
             enqueueClosedShiftLog(this.machineId, state, nowUtc);
             state.stopCount = 0;
             state.stopsData = createEmptyStopsData();
-            if (currentStop === 0) {
+            if (continuedStop && isRunning === false) {
+                state.activeStop = {
+                    ...continuedStop,
+                    start: nowUtc,
+                };
+                state.lastStopTime = nowUtc;
+            } else if (isRunning === true) {
                 state.lastStartTime = nowUtc;
             }
         }
 
+        if (isRunning === false) {
+            currentStop = state.activeStop
+                ? state.activeStop.statusCode
+                : stopReasonCode || machineState.stateCode || 1;
+        }
+
         state.stop = currentStop;
         state.stopReasonCode = stopReasonCode;
-        state.stopReasonText = stopReasonText;
+        state.stopReasonText = state.activeStop ? state.activeStop.reasonText : stopReasonText;
+        if (isRunning === true || isRunning === false) {
+            state.machineRunning = isRunning;
+        }
         if(shiftInfo) {
             state.shiftCode = currentShiftCode;
             state.shiftRaw = currentShiftRaw;
@@ -707,10 +822,22 @@ class HaiwellMachineReader {
     buildRawData() {
         const density = getWeftDensity(this.values);
         const shiftInfo = normalizeShift(this.values.get(IDS.currentShift));
+        const machineState = getMachineState(this.values);
+        const stopReasonCode = integerOrNull(this.values.get(IDS.stopReasonCode));
+        const stopReasonText = textOrNull(this.values.get(IDS.stopReasonText));
+        const state = machineData[this.machineId];
+        const displayedStop = machineState.running === false
+            ? state && state.activeStop
+                ? state.activeStop.statusCode
+                : stopReasonCode || 0
+            : 0;
+        const displayedStopText = machineState.running === false && state && state.activeStop
+            ? state.activeStop.reasonText
+            : stopReasonText;
         let rawData = [
             shiftInfo ? shiftInfo.number : null,
-            integerOrNull(this.values.get(IDS.stopReasonCode)) ? (numberOrNull(this.values.get(IDS.loomSpeed)) >= 20 ? 0:  integerOrNull(this.values.get(IDS.stopReasonCode))) : 0,
-            textOrNull(this.values.get(IDS.stopReasonText)) ? textOrNull(this.values.get(IDS.stopReasonText)) : '',
+            displayedStop,
+            displayedStopText ? displayedStopText : '',
             numberOrNull(this.values.get(IDS.loomSpeed)),
             numberOrNull(this.values.get(IDS.weftDensityDisplay)),
             integerOrNull(this.values.get(IDS.remainingWarp)),
