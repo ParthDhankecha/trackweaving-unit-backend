@@ -13,7 +13,7 @@ app.use(express.json());
 
 const CONFIG = {
     apiBaseUrl: process.env.API_BASE_URL || "https://trackweaving.com/api/v1",
-    workspaceId: process.env.WORKSPACE_ID || "6aa9250204dce64c1bf837a5",
+    workspaceId: process.env.WORKSPACE_ID || "6ab363322d9c860c79f6909f",
     apiKey: process.env.API_KEY || "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21",
     port: parseInt(process.env.PORT || "3001", 10),
     /*
