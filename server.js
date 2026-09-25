@@ -3,9 +3,8 @@ const express = require("express");
 const axios = require("axios");
 const ModbusRTU = require("modbus-serial");
 const moment = require("moment");
-const fs = require("fs");
-const path = require("path");
 const https = require("https");
+const pendingShiftStore = require("./lib/pendingShiftStore");
 const axiosInstance = axios.create({
     timeout: 15000,
     httpsAgent: new https.Agent({
@@ -24,9 +23,11 @@ const READ_TIMEOUT_MS = parseInt(process.env.READ_TIMEOUT_MS || "7000", 10);
 const MAX_REGS_PER_READ = parseInt(process.env.MAX_REGS_PER_READ || "60", 10);
 
 const workspaceId = "6a47941530e89397e63fa219";
-const apiKey = "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21";
-const API_BASE_URL = process.env.API_BASE_URL || "https://trackweaving.com/api/v1";
-const PENDING_SHIFT_LOGS_PATH = process.env.PENDING_SHIFT_LOGS_PATH || path.join(process.cwd(), "pending-shift-logs.json");
+const API_KEY =
+    process.env.TRACKWEAVING_API_KEY ||
+    "4d38b5078b4bcd8122e3af614b1239379de1205d85e48808555eb8ca13019f21";
+const MACHINE_LOGS_URL =
+    process.env.TRACKWEAVING_API_URL || "https://trackweaving.com/api/v1/machine-logs";
 
 const REGISTER = {
     nazon: {
@@ -73,7 +74,6 @@ const UNIT_IDS = {
 
 let machineData = {};
 let isDataStorAPICalled = false;
-let pendingShiftLogs = [];
 
 // Track all active clients for graceful shutdown
 const allClients = new Set();
@@ -100,102 +100,8 @@ function initMachineData(machineId, displayType) {
     };
 }
 
-function ensureStopsDataShape(entry) {
-    const defaults = { warp: [], weft: [], feeder: [], manual: [], other: [], h1: [], h2: [] };
-    if (!entry.stopsData || typeof entry.stopsData !== "object") {
-        entry.stopsData = {};
-    }
-    for (const key of Object.keys(defaults)) {
-        if (!Array.isArray(entry.stopsData[key])) {
-            entry.stopsData[key] = [];
-        }
-    }
-}
-
-function loadPendingShiftLogs() {
-    try {
-        if (!fs.existsSync(PENDING_SHIFT_LOGS_PATH)) {
-            pendingShiftLogs = [];
-            return;
-        }
-
-        const parsed = JSON.parse(fs.readFileSync(PENDING_SHIFT_LOGS_PATH, "utf8"));
-        if (Array.isArray(parsed)) {
-            pendingShiftLogs = parsed;
-        } else if (parsed && Array.isArray(parsed.logs)) {
-            pendingShiftLogs = parsed.logs;
-        } else {
-            pendingShiftLogs = [];
-        }
-    } catch (error) {
-        console.error("Failed to load pending shift logs:", error.message);
-        pendingShiftLogs = [];
-    }
-}
-
-function persistPendingShiftLogs() {
-    const tmpPath = `${PENDING_SHIFT_LOGS_PATH}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify({ logs: pendingShiftLogs }, null, 2));
-    fs.renameSync(tmpPath, PENDING_SHIFT_LOGS_PATH);
-}
-
-function enqueueClosedShiftLog(machineId, state, endedAt) {
-    pendingShiftLogs.push({
-        id: `${machineId}-${Date.now()}-${state.shift ?? "x"}`,
-        machineId,
-        updatedTime: endedAt,
-        lastStopTime: state.lastStopTime || null,
-        lastStartTime: state.lastStartTime || null,
-        stop: state.stop,
-        stopsData: JSON.parse(JSON.stringify(state.stopsData || {})),
-        rawData: JSON.parse(JSON.stringify(state.rawData || [])),
-        displayType: state.displayType,
-        stopCount: state.stopCount || 0,
-        shift: state.shift,
-    });
-
-    try {
-        persistPendingShiftLogs();
-        console.log(
-            `[${machineId}] Stored closed shift locally (${pendingShiftLogs.length} pending)`,
-        );
-    } catch (error) {
-        console.error(`[${machineId}] Failed to store closed shift:`, error.message);
-    }
-}
-
-function removePendingShiftLogs(ids) {
-    const remove = new Set(ids);
-    pendingShiftLogs = pendingShiftLogs.filter((log) => !remove.has(log.id));
-
-    try {
-        persistPendingShiftLogs();
-    } catch (error) {
-        console.error("Failed to update pending shift logs:", error.message);
-    }
-}
-
-async function flushPendingShiftLogs() {
-    if (!pendingShiftLogs.length) {
-        return;
-    }
-
-    const toFlush = pendingShiftLogs.slice();
-
-    await axiosInstance.post(`${API_BASE_URL}/machine-logs/shift`, {
-        logs: toFlush,
-        workspaceId,
-        apiKey,
-    });
-
-    removePendingShiftLogs(toFlush.map((log) => log.id));
-    console.log(`Flushed ${toFlush.length} closed shift log(s)`);
-}
-
 function setStopData(machineId, displayType) {
     let stopDuration = 0;
-
-    ensureStopsDataShape(machineData[machineId]);
 
     if (machineData[machineId].lastStopTime) {
         const stopTime = moment(machineData[machineId].lastStopTime);
@@ -340,11 +246,13 @@ function processData(machine, data) {
             machineData[machineId].lastStopTime = moment().utc().format();
         }
 
-        enqueueClosedShiftLog(
-            machineId,
-            JSON.parse(JSON.stringify(machineData[machineId])),
-            moment().utc().format(),
+        const closedShiftSnapshot = JSON.parse(
+            JSON.stringify(machineData[machineId])
         );
+        machineData[machineId].prevData = closedShiftSnapshot;
+        pendingShiftStore.enqueueClosedShift(machineId, closedShiftSnapshot).catch((err) => {
+            console.error(`Failed to queue closed shift for ${machineId}:`, err?.message || err);
+        });
         machineData[machineId].stopCount = 0;
         machineData[machineId].stopsData = {
             warp: [],
@@ -377,6 +285,48 @@ function processData(machine, data) {
 
     machineData[machineId].rawData = data;
     machineData[machineId].shift = shift;
+}
+
+const toUint32 = (hi, lo) => (((hi << 16) >>> 0) + (lo >>> 0)) >>> 0;
+
+// Reject corrupted Modbus snapshots before they update local state / backend.
+function isSuspiciousMachineData(displayType, data, start) {
+    if (data.length <= 30) {
+        return false;
+    }
+
+    if (displayType === "biana") {
+        const atReg = (reg) => data[reg - 1] ?? 0;
+        const speedDay = atReg(43);
+        const speedNight = atReg(73);
+        const stateCode = atReg(8);
+        const picksDay = toUint32(atReg(59), atReg(58));
+        const picksNight = toUint32(atReg(89), atReg(88));
+        const pieceLenDay = toUint32(atReg(61), atReg(60));
+        const pieceLenNight = toUint32(atReg(91), atReg(90));
+        const hasStrayHeaderValues =
+            atReg(2) !== 0 || atReg(3) !== 0 || atReg(4) !== 0;
+        const productionMetricsZero =
+            speedDay === 0 &&
+            speedNight === 0 &&
+            stateCode === 0 &&
+            picksDay === 0 &&
+            picksNight === 0 &&
+            pieceLenDay === 0 &&
+            pieceLenNight === 0;
+        return hasStrayHeaderValues && productionMetricsZero;
+    }
+
+    const reg = REGISTER[displayType];
+    if (!reg?.clothLength) {
+        return false;
+    }
+
+    return (
+        data[reg.clothLength - start] === 0 &&
+        data[reg.loomState - start] === 0 &&
+        data[reg.speed - start] === 0
+    );
 }
 
 function withTimeout(promise, ms, label) {
@@ -518,14 +468,7 @@ async function pollLoop(machine) {
 
                 const data = resp.data || [];
 
-                const reg = REGISTER[displayType];
-                if (
-                    displayType !== "biana" &&
-                    data.length > 30 &&
-                    data[reg.clothLength - start] === 0 &&
-                    data[reg.loomState - start] === 0 &&
-                    data[reg.speed - start] === 0
-                ) {
+                if (isSuspiciousMachineData(displayType, data, start)) {
                     console.log(`Suspicious zero data from ${ip}:`, data);
                 } else {
                     processData(machine, data);
@@ -558,20 +501,14 @@ async function initAllMachines() {
     while(true) {
         try {
             console.log("Fetching machine list...");
-            let initData = await axiosInstance.post(
-                `${API_BASE_URL}/machine-logs/machine-list`,
-                {
-                    workspaceId,
-                    apiKey
-                }
-            );
+            let initData = await axiosInstance.post(`${MACHINE_LOGS_URL}/machine-list`, {
+                workspaceId: workspaceId,
+                apiKey: API_KEY
+            });
             initData = initData.data;
 
             // preload machineData if backend sends something
             machineData = initData.data.machineData || {};
-            for (const machineId in machineData) {
-                ensureStopsDataShape(machineData[machineId]);
-            }
 
             for (let machine of initData.data.machines) {
                 // fire and forget, each has its own loop and connection
@@ -593,7 +530,48 @@ async function initAllMachines() {
 // ====== PERIODIC DATA PUSH ======
 let dataPushDelay = 5000;
 
+function isLikelyNetworkError(error) {
+    const code = error?.code;
+    return (
+        code === "ENOTFOUND" ||
+        code === "ECONNRESET" ||
+        code === "ECONNREFUSED" ||
+        code === "ETIMEDOUT" ||
+        code === "EAI_AGAIN" ||
+        !error?.response
+    );
+}
+
+async function flushPendingShiftLogs() {
+    const pending = await pendingShiftStore.listPending();
+    if (!pending.length) {
+        return;
+    }
+
+    const logs = pending.map((entry) => entry.payload);
+    await axiosInstance.post(`${MACHINE_LOGS_URL}/shift`, {
+        logs,
+        workspaceId,
+        apiKey: API_KEY
+    });
+
+    await pendingShiftStore.removeByIds(pending.map((entry) => entry.id));
+    console.log(new Date(), `Synced ${logs.length} closed shift log(s) to backend`);
+}
+
 async function dataPushLoop() {
+    let hadError = false;
+
+    try {
+        await flushPendingShiftLogs();
+    } catch (error) {
+        hadError = true;
+        console.log(new Date(), "Error syncing closed shift logs:", error?.message || error);
+        if (isLikelyNetworkError(error)) {
+            axiosInstance.defaults.httpsAgent.destroy();
+        }
+    }
+
     try {
         const dataToSend = {};
         for (let machineId in machineData) {
@@ -602,50 +580,46 @@ async function dataPushLoop() {
                 m.updatedTime &&
                 moment().diff(moment(m.updatedTime), "hours") < 1
             ) {
-                dataToSend[machineId] = { ...m };
-                delete dataToSend[machineId].prevData;
+                const { prevData, ...rest } = m;
+                dataToSend[machineId] = { ...rest, ...(prevData ? { prevData } : {}) };
             }
         }
-        await axiosInstance.post(`${API_BASE_URL}/machine-logs`, {
+        await axiosInstance.post(MACHINE_LOGS_URL, {
             logs: dataToSend,
-            workspaceId,
-            apiKey
+            workspaceId: workspaceId,
+            apiKey: API_KEY
         });
 
-        dataPushDelay = 5000; // reset delay on success
-
-        try {
-            await flushPendingShiftLogs();
-        } catch (error) {
-            console.log(new Date(), "Shift log flush error:", error?.message || error);
+        const pendingByMachine = await pendingShiftStore.pendingCountByMachine();
+        for (let machineId in machineData) {
+            if (machineData[machineId].prevData && !pendingByMachine[machineId]) {
+                machineData[machineId].prevData = null;
+            }
         }
     } catch (error) {
+        hadError = true;
         console.log(new Date(), "Error in data store interval:", error?.message || error);
-        dataPushDelay = Math.min(dataPushDelay * 2, 60000); // exponential backoff up to 1 min
-        if (error.code === "ENOTFOUND" || error.code === "ECONNRESET") {
+        if (isLikelyNetworkError(error)) {
             axiosInstance.defaults.httpsAgent.destroy();
         }
     }
 
+    dataPushDelay = hadError ? Math.min(dataPushDelay * 2, 60000) : 5000;
     setTimeout(dataPushLoop, dataPushDelay);
 }
 
-loadPendingShiftLogs();
-if (pendingShiftLogs.length) {
-    console.log(`Pending closed shift logs on disk: ${pendingShiftLogs.length}`);
-}
-dataPushLoop();
+pendingShiftStore.load().then(() => {
+    dataPushLoop();
+}).catch((err) => {
+    console.error("Failed to load pending shift queue:", err?.message || err);
+    dataPushLoop();
+});
 
 // ====== EXPRESS SERVER ======
 const PORT = parseInt(process.env.PORT || "3001", 10);
 
 app.get("/health", (req, res) => {
-    res.json({
-        ok: true,
-        time: new Date(),
-        machines: Object.keys(machineData).length,
-        pendingShiftLogs: pendingShiftLogs.length,
-    });
+    res.json({ ok: true, time: new Date(), machines: Object.keys(machineData).length });
 });
 
 app.listen(PORT, () => {
